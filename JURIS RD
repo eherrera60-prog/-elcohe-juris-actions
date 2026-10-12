@@ -1,0 +1,235 @@
+from __future__ import annotations
+
+import hashlib
+import os
+import re
+from urllib.parse import quote_plus, urlparse
+
+import httpx
+from bs4 import BeautifulSoup
+from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel, HttpUrl
+
+APP_VERSION = "1.4.0"
+TC_SEARCH_URL = "https://www.tribunalconstitucional.gob.do/consultas/secretar%C3%ADa/sentencias/"
+SCJ_PORTAL_URL = "https://consultasentenciascj.poderjudicial.gob.do/"
+ALLOWED_HOST_SUFFIXES = (
+    "tribunalconstitucional.gob.do",
+    "poderjudicial.gob.do",
+    "consultasentenciascj.poderjudicial.gob.do",
+    "tribunalsitestorage.blob.core.windows.net",
+)
+
+app = FastAPI(title="ELCOHE-JURIS RD Jurisprudence Actions", version=APP_VERSION)
+
+
+class VerifyRequest(BaseModel):
+    url: HttpUrl
+    expected_court: str | None = None
+    expected_number: str | None = None
+
+
+def allowed_host(host: str | None) -> bool:
+    if not host:
+        return False
+    host = host.lower().strip(".")
+    return any(host == suffix or host.endswith("." + suffix) for suffix in ALLOWED_HOST_SUFFIXES)
+
+
+def normalize_space(value: str | None) -> str | None:
+    if value is None:
+        return None
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def tc_candidate_links(html: str, limit: int) -> list[dict]:
+    soup = BeautifulSoup(html, "html.parser")
+    results: list[dict] = []
+    seen: set[str] = set()
+    pattern = re.compile(r"TC/\d{3,4}/\d{2}", re.I)
+    for a in soup.find_all("a", href=True):
+        text = normalize_space(a.get_text(" ", strip=True)) or ""
+        match = pattern.search(text)
+        if not match:
+            continue
+        number = match.group(0).upper()
+        href = a["href"]
+        if href.startswith("/"):
+            href = "https://www.tribunalconstitucional.gob.do" + href
+        if href in seen:
+            continue
+        seen.add(href)
+        parent_text = normalize_space(a.parent.get_text(" ", strip=True) if a.parent else text)
+        date_match = re.search(r"\b\d{2}-\d{2}-\d{4}\b", parent_text or "")
+        ref_match = re.search(r"TC-\d{2}-\d{4}-\d{4}", parent_text or "", re.I)
+        results.append({
+            "court": "TC",
+            "decision_number": number,
+            "date": date_match.group(0) if date_match else None,
+            "reference": ref_match.group(0).upper() if ref_match else None,
+            "relative_to": parent_text,
+            "source_url": href,
+            "status": "LOCATED",
+            "note": "Localizada en el portal oficial del Tribunal Constitucional; abra/verifique el documento antes de atribuir ratio decidendi.",
+        })
+        if len(results) >= limit:
+            break
+    return results
+
+
+@app.get("/health")
+def health():
+    return {"ok": True, "service": "ELCOHE-JURIS RD Jurisprudence Actions", "version": APP_VERSION}
+
+
+@app.get("/v1/tc/search")
+async def search_tc(
+    q: str = Query(min_length=2, max_length=240),
+    year: int | None = Query(default=None, ge=2012, le=2100),
+    limit: int = Query(default=10, ge=1, le=20),
+):
+    params = {
+        "searchString": q,
+        "searchCriteria": "",
+        "size": max(limit, 10),
+    }
+    if year:
+        # El portal usa filtros internos que pueden cambiar; mantener el año como criterio textual
+        # evita afirmar una semántica de parámetro no documentada.
+        params["searchString"] = f'{q} {year}'
+    try:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers={"User-Agent": "ELCOHE-JURIS-RD/1.4"}) as client:
+            resp = await client.get(TC_SEARCH_URL, params=params)
+            resp.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"No fue posible consultar el portal oficial del TC: {exc}")
+    results = tc_candidate_links(resp.text, limit)
+    return {
+        "query": q,
+        "source": str(resp.url),
+        "results": results,
+        "warning": "Los resultados son candidatos localizados en fuente oficial. Verifique el PDF/documento antes de citar una regla jurídica.",
+    }
+
+
+@app.get("/v1/scj/search-plan")
+def prepare_scj_search(
+    q: str = Query(min_length=2, max_length=240),
+    chamber: str | None = Query(default=None, max_length=80),
+    matter: str | None = Query(default=None, max_length=80),
+    year_from: int | None = Query(default=None, ge=1908, le=2100),
+    year_to: int | None = Query(default=None, ge=1908, le=2100),
+):
+    if year_from and year_to and year_from > year_to:
+        raise HTTPException(status_code=400, detail="year_from no puede ser mayor que year_to")
+    filters = {"sala": chamber, "materia": matter, "desde": year_from, "hasta": year_to}
+    filters = {k: v for k, v in filters.items() if v is not None}
+    site_q = f'site:poderjudicial.gob.do "{q}"'
+    if chamber:
+        site_q += f' "{chamber}"'
+    if matter:
+        site_q += f' "{matter}"'
+    queries = [site_q, f'site:poderjudicial.gob.do/wp-content/uploads "{q}" sentencia']
+    return {
+        "query": q,
+        "official_portal": SCJ_PORTAL_URL,
+        "filters": filters,
+        "search_steps": [
+            "Abrir el buscador oficial de la SCJ.",
+            "Aplicar Sala, Materia y rango temporal cuando estén disponibles.",
+            "Buscar primero por número de sentencia/expediente si existe; de lo contrario, usar términos jurídicos específicos.",
+            "Localizar candidatos en dominio oficial poderjudicial.gob.do.",
+            "Abrir la decisión y ejecutar verifyOfficialDocument antes de citar el criterio.",
+        ],
+        "web_queries": queries,
+        "status": "SEARCH_PLAN_ONLY",
+        "warning": "La interfaz oficial de consulta SCJ es dinámica. Este endpoint no declara decisiones verificadas ni simula resultados inexistentes.",
+    }
+
+
+@app.post("/v1/verify")
+async def verify_document(body: VerifyRequest):
+    url = str(body.url)
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or not allowed_host(parsed.hostname):
+        raise HTTPException(status_code=400, detail="La URL debe ser HTTPS y pertenecer a un dominio oficial permitido.")
+    try:
+        async with httpx.AsyncClient(timeout=25, follow_redirects=True, headers={"User-Agent": "ELCOHE-JURIS-RD/1.4"}) as client:
+            resp = await client.get(url)
+    except httpx.HTTPError as exc:
+        return {
+            "status": "NOT_VERIFIED", "official_domain": True, "court": body.expected_court,
+            "url": url, "final_url": None, "http_status": None, "content_type": None,
+            "title": None, "detected_number": None, "expected_number_match": None,
+            "sha256": None, "note": f"El dominio es oficial, pero no fue posible obtener el documento: {exc}",
+        }
+
+    final_url = str(resp.url)
+    final_host = urlparse(final_url).hostname
+    if not allowed_host(final_host):
+        return {
+            "status": "REJECTED", "official_domain": False, "court": body.expected_court,
+            "url": url, "final_url": final_url, "http_status": resp.status_code,
+            "content_type": resp.headers.get("content-type"), "title": None,
+            "detected_number": None, "expected_number_match": None, "sha256": None,
+            "note": "La redirección terminó fuera de los dominios oficiales permitidos.",
+        }
+
+    data = resp.content
+    content_type = (resp.headers.get("content-type") or "").split(";")[0].lower()
+    title = None
+    text_sample = ""
+    if "html" in content_type:
+        soup = BeautifulSoup(resp.text, "html.parser")
+        title = normalize_space(soup.title.get_text(" ", strip=True) if soup.title else None)
+        text_sample = normalize_space(soup.get_text(" ", strip=True)) or ""
+    number_pattern = re.compile(r"(?:TC/\d{3,4}/\d{2}|SCJ-[A-Z]{2}-\d{2}-\d{3,5}|\bSentencia\s+(?:núm\.?|No\.?)\s*[A-Za-z0-9-]+)", re.I)
+    detected = None
+    if text_sample:
+        m = number_pattern.search(text_sample[:250000])
+        detected = normalize_space(m.group(0)) if m else None
+    expected_match = None
+    if body.expected_number:
+        haystack = (detected or "") + " " + text_sample[:250000]
+        expected_match = body.expected_number.lower().replace(" ", "") in haystack.lower().replace(" ", "")
+
+    ok_status = 200 <= resp.status_code < 300
+    status = "VERIFIED_SOURCE" if ok_status and ("pdf" in content_type or "html" in content_type) else "LOCATED_OFFICIAL"
+    note = "Fuente oficial obtenida. La verificación de fuente no equivale por sí sola a haber identificado la ratio decidendi."
+    if expected_match is False:
+        status = "NOT_VERIFIED"
+        note = "La fuente es oficial, pero no se encontró el número esperado en el contenido accesible. Revise manualmente el documento."
+
+    court = body.expected_court
+    if not court:
+        if "tribunalconstitucional" in (final_host or "") or "tribunalsitestorage" in (final_host or ""):
+            court = "TC"
+        elif "poderjudicial" in (final_host or ""):
+            court = "SCJ"
+
+    return {
+        "status": status,
+        "official_domain": True,
+        "court": court,
+        "url": url,
+        "final_url": final_url,
+        "http_status": resp.status_code,
+        "content_type": content_type or None,
+        "title": title,
+        "detected_number": detected,
+        "expected_number_match": expected_match,
+        "sha256": hashlib.sha256(data).hexdigest() if data else None,
+        "note": note,FROM python:3.12-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY app.py .
+ENV PORT=8000
+CMD ["sh", "-c", "uvicorn app:app --hofastapi==0.115.6
+uvicorn[standard]==0.34.0
+httpx==0.28.1
+beautifulsoup4==4.12.3
+pydantic==2.10.4
+st 0.0.0.0 --port ${PORT}"]
+
+    }
