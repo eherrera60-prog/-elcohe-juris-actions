@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, HttpUrl, Field
 from pypdf import PdfReader
 
-APP_VERSION = "1.5.3"
+APP_VERSION = "1.5.4"
 MAX_DOCUMENT_BYTES = 12 * 1024 * 1024
 MAX_PDF_PAGES = 350
 MAX_REDIRECTS = 3
@@ -75,13 +75,16 @@ def overlap_ratio(a: str, b: str) -> float:
     return len(ta & tb) / max(len(ta), 1) if ta else 0.0
 
 def detect_court(host: str | None, expected: str | None = None, text: str | None = None):
-    """Identify court from the document's own opening, not solely its hosting domain."""
-    opening = fold((text or "")[:4500])
-    tc = bool(re.search(r"\btribunal constitucional\b|\bTC/\d{3,4}/\d{2}\b", opening, re.I))
-    scj = bool(re.search(r"\bsuprema corte de justicia\b|\bSCJ-[A-Z]{2}-\d{2}-\d{3,5}\b", opening, re.I))
-    if tc and not scj: return "TC"
-    if scj and not tc: return "SCJ"
-    if tc and scj: return None  # Conflicting evidence requires manual inspection.
+    """Use decision-header evidence; referenced courts in background do not govern."""
+    opening = (text or "")[:2200]
+    tc_number = re.search(r"\b(?:SENTENCIA\s+)?TC/\d{3,4}/\d{2}\b", opening, re.I)
+    scj_number = re.search(r"\bSCJ-[A-Z]{2}-\d{2}-\d{3,5}\b", opening, re.I)
+    if tc_number and not scj_number: return "TC"
+    if scj_number and not tc_number: return "SCJ"
+    if tc_number and scj_number: return None
+    top = fold(opening[:500])
+    if "tribunal constitucional" in top and "suprema corte de justicia" not in top: return "TC"
+    if "suprema corte de justicia" in top and "tribunal constitucional" not in top: return "SCJ"
     return None
 
 
@@ -115,87 +118,133 @@ def context_for_page(pages: list[dict], page_number: int, window: int = 1) -> di
     """Return neighboring pages as context; not proof of authorship."""
     return {"page": page_number, "context_pages": [p["page"] for p in pages if abs(p["page"] - page_number) <= window]}
 
+MONTHS = ("enero", "febrero", "marzo", "abril", "mayo", "junio", "julio",
+          "agosto", "septiembre", "octubre", "noviembre", "diciembre")
+SPANISH_NUMBERS = {"uno":1,"dos":2,"tres":3,"cuatro":4,"cinco":5,"seis":6,"siete":7,
+    "ocho":8,"nueve":9,"diez":10,"once":11,"doce":12,"trece":13,"catorce":14,
+    "quince":15,"dieciseis":16,"dieciséis":16,"diecisiete":17,"dieciocho":18,
+    "diecinueve":19,"veinte":20,"veintiuno":21,"veintidos":22,"veintidós":22,
+    "veintitres":23,"veintitrés":23,"veinticuatro":24,"veinticinco":25,
+    "veintiseis":26,"veintiséis":26,"veintisiete":27,"veintiocho":28,
+    "veintinueve":29,"treinta":30,"treinta y uno":31}
+
 def extract_metadata_from_text(text: str, court: str | None) -> dict[str, Any]:
-    sample = text[:500000]
-    meta = {"decision_number": None, "date": None, "case_number": None, "chamber": None}
-    for pat in [
-        r"\bTC/\d{3,4}/\d{2}\b",
-        r"\bSCJ-[A-Z]{2}-\d{2}-\d{3,5}\b",
-        r"\bSentencia\s+(?:núm\.?|No\.?)\s*[A-Za-z0-9./-]+",
-    ]:
-        m = re.search(pat, sample, re.I)
-        if m: meta["decision_number"] = normalize_space(m.group(0)); break
-    for pat in [
-        r"\b\d{1,2}\s+de\s+(?:enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre)\s+de\s+\d{4}\b",
-        r"\b\d{1,2}[/-]\d{1,2}[/-]\d{4}\b",
-    ]:
-        m = re.search(pat, sample, re.I)
-        if m: meta["date"] = normalize_space(m.group(0)); break
-    for pat in [
-        r"\b(?:expediente|exp\.)\s*(?:n[úu]m\.?|no\.?|n[°º]\.?)\s*[:#-]?\s*([A-Za-z0-9][A-Za-z0-9./-]{5,})",
-        r"\b(TC-\d{2}-\d{4}-\d{4})\b",
-    ]:
-        m = re.search(pat, sample, re.I)
-        if m:
-            meta["case_number"] = m.group(1).rstrip(".,;")
-            break
-    for pat in [r"\bPrimera Sala\b", r"\bSegunda Sala\b", r"\bTercera Sala\b", r"\bSalas Reunidas\b", r"\bPleno\b"]:
-        m = re.search(pat, sample, re.I)
-        if m: meta["chamber"] = m.group(0); break
-    if court == "TC": meta["chamber"] = "Tribunal Constitucional"
-    primary = primary_decision_number(text, court)
-    if primary: meta["decision_number"] = primary
+    """Extract identifying fields from the opening, never from cited judgments."""
+    opening = (text or "")[:6500]
+    meta = {"decision_number": primary_decision_number(text, court), "date": None,
+            "case_number": None, "chamber": None}
+    if court == "TC":
+        m = re.search(r"\bTC-\d{2}-\d{4}-\d{4}\b", opening, re.I)
+        if m: meta["case_number"] = m.group(0).upper()
+        meta["chamber"] = "Tribunal Constitucional"
+        # Date is the issuance formula, not a date in the procedural history.
+        m = re.search(r"\ba los\s+([a-záéíóúñ ]+?)\s*\(\s*(\d{1,2})\s*\)\s*d[ií]as?\s+del\s+mes\s+de\s+(" + "|".join(MONTHS) + r")\s+del\s+a[nñ]o\s+dos\s+mil\s+[a-záéíóúñ ]+?\(\s*(20\d{2})\s*\)", opening, re.I)
+        if m: meta["date"] = f"{int(m.group(2))} de {m.group(3).lower()} de {m.group(4)}"
+        if not meta["date"]:
+            m = re.search(r"\ba los\s+([a-záéíóúñ ]+?)\s*\(\s*(\d{1,2})\s*\)\s*d[ií]as?\s+del\s+mes\s+de\s+(" + "|".join(MONTHS) + r")\s+del\s+a[nñ]o", opening, re.I)
+            if m:
+                y = re.search(r"\b(20\d{2})\b", opening[m.end():m.end()+110])
+                if y: meta["date"] = f"{int(m.group(2))} de {m.group(3).lower()} de {y.group(1)}"
+    elif court == "SCJ":
+        m = re.search(r"\b\(?(20\d{2}-R\d{5,})\)?", opening, re.I)
+        if m: meta["case_number"] = m.group(1)
+        if not meta["case_number"]:
+            m = re.search(r"\b(?:expediente|exp\.)\s*(?:n[úu]m\.?|no\.?)\s*[:#-]?\s*([A-Za-z0-9][A-Za-z0-9./-]{5,})", opening, re.I)
+            if m: meta["case_number"] = m.group(1)
+        m = re.search(r"\b(PRIMERA|SEGUNDA|TERCERA)\s+SALA\s+DE\s+LA\s+SUPREMA", opening, re.I)
+        if m: meta["chamber"] = m.group(1).capitalize() + " Sala"
+        m = re.search(r"\ben fecha\s+(\d{1,2})\s+de\s+(" + "|".join(MONTHS) + r")\s+de\s+(20\d{2})", opening, re.I)
+        if m: meta["date"] = f"{int(m.group(1))} de {m.group(2).lower()} de {m.group(3)}"
     return meta
 
+# Attribution is deliberately conservative: a keyword alone is not judicial authorship.
+REVIEWED_COURT_INTRO = re.compile(
+    r"(?:esta sala|este tribunal|esta suprema corte|este tribunal constitucional)\s+"
+    r"(?:considera|advierte|estima|observa|comprueba|entiende|juzga|verifica|retiene|establece)", re.I)
+LOWER_COURT_INTRO = re.compile(
+    r"(?:la corte a qua|la corte de apelaci[oó]n|el tribunal a quo|la jurisdicci[oó]n de fondo|"
+    r"la sentencia impugnada|la corte recurrida|la alzada)", re.I)
+PARTY_INTRO = re.compile(
+    r"(?:la parte recurrente|la parte recurrida|el recurrente|la recurrente|"
+    r"la demandante|la demandada|la apelante|el apelante)\s+"
+    r"(?:alega|sostiene|afirma|argumenta|aduce|expone|invoca|señala)", re.I)
+QUOTED_LOWER_COURT = re.compile(
+    r"(?:finalmente\s+concluye\s+la\s+corte\s+motivando\s+lo\s+siguiente)|"
+    r"(?:la corte|el tribunal|la alzada)\s+(?:motiv[oó]|expres[oó]|estableci[oó]|"
+    r"concluy[oó]|consider[oó])\s+(?:lo siguiente|que)|"
+    r"(?:la sentencia|el fallo)\s+(?:impugnada|recurrida)\s+(?:establece|expresa|señala)", re.I)
+DISPOSITIVE_INTRO = re.compile(r"^\s*(?:FALLA|DECIDE|RESUELVE)\s*:?\s*$", re.I)
+NUMBERED_START = re.compile(r"(?m)^\s*\d{1,3}[).]\s+")
+
+def strip_running_furniture(text: str) -> str:
+    # Strip only recurrent page furniture; do not collapse substantive paragraphs.
+    lines = text.splitlines()
+    kept = []
+    for line in lines:
+        t = normalize_space(line)
+        if re.match(r"^(?:Av\. Enrique Jim[eé]nez Moya|Direcci[oó]n de Internet:|Tel\.:)", t, re.I):
+            continue
+        if re.match(r"^(?:Exp\. n[uú]m\.|Partes:|Materia:|Decisi[oó]n:|Ponente:|WT/|P[aá]g\.\s*\d+)", t, re.I):
+            continue
+        if re.match(r"^(?:REP[ÚU]BLICA DOMINICANA|SUPREMA CORTE DE JUSTICIA|TRIBUNAL CONSTITUCIONAL)$", t, re.I):
+            continue
+        kept.append(line)
+    return "\n".join(kept)
+
 def split_units(text: str):
-    """Segment by numbered paragraphs and judicial transitions, not mere keywords."""
-    text = re.sub(r"\r\n?", "\n", text)
-    parts = re.split(
-        r"\n{2,}|\n(?=\s*\d{1,3}\.\s)|(?<=[.;:])\s+(?=(?:Que|Considerando|Por cuanto|En ese sentido|Esta Sala|Este Tribunal)\b)",
-        text, flags=re.I,
-    )
-    return [normalize_space(p) for p in parts if len(normalize_space(p)) >= 80]
+    """Conservative segmentation. Never alter numbered markers or discard short units."""
+    text = strip_running_furniture(text.replace("\r\n", "\n").replace("\r", "\n"))
+    # An inline numbered boundary must follow terminal punctuation; do not
+    # mistake article numbers, dates, or citations for paragraph markers.
+    text = re.sub(r"(?<=[.!?;:])([ \t]+)(?=\d{1,3}[).][ \t]+[A-ZÁÉÍÓÚÑ])", "\n", text)
+    parts = re.split(r"\n[ \t]*\n+|\n(?=[ \t]*\d{1,3}[).][ \t]+)", text)
+    return [normalize_space(part) for part in parts if normalize_space(part)]
 
 
-def classify_passage(passage: str) -> tuple[str, list[str]]:
-    """Heuristic triage only. A marker is never proof of judicial authorship."""
-    p = fold(passage)
-    party_markers = (
-        "la parte recurrente", "la parte recurrida", "la recurrente sostiene",
-        "la recurrente alega", "la parte demandante", "la parte demandada",
-        "alega que", "argumenta que", "sostiene que", "aduce que",
-        "en su memorial", "en su escrito de defensa", "como medio de casacion",
-        "el recurrente sostiene", "el recurrente alega", "la apelante sostiene",
-    )
-    court_markers = (
-        "esta sala considera", "esta sala advierte", "esta sala estima",
-        "esta corte considera", "este tribunal considera", "esta jurisdiccion entiende",
-        "esta primera sala", "esta segunda sala", "esta tercera sala",
-        "esta sala ha juzgado", "esta sala ha establecido",
-        "por tales motivos", "por estas razones", "procede rechazar",
-        "procede casar", "se impone rechazar", "se impone casar",
-    )
-    found_party = [x for x in party_markers if x in p]
-    found_court = [x for x in court_markers if x in p]
-    if found_party:
-        return "PARTY_ARGUMENT_OR_MIXED_REVIEW", found_party[:4]
-    if found_court:
-        return "POSSIBLE_JUDICIAL_REASONING_REVIEW", found_court[:4]
+def attribution_context(passage: str, preceding: str = "", following: str = "") -> tuple[str, list[str]]:
+    """Classify with precedence for lower-court quotations and mixed excerpts.
+
+    A positive judicial marker is a *candidate*, never proof of ratio decidendi.
+    """
+    p = normalize_space(passage)
+    prior = normalize_space(preceding)
+    following = normalize_space(following)
+    indicators = []
+    # Introductory framing from an earlier numbered unit can govern the quote.
+    quote_intro = QUOTED_LOWER_COURT.search(p) or QUOTED_LOWER_COURT.search(prior[-650:])
+    if quote_intro:
+        return "LOWER_COURT_QUOTATION_REVIEW", ["lower_court_quotation_or_intro"]
+    if PARTY_INTRO.search(p) or re.search(r"(?:en su memorial de casaci[oó]n|la parte recurrente sostiene)", p, re.I):
+        return "PARTY_ARGUMENT_OR_MIXED_REVIEW", ["party_argument_or_mixed"]
+    if re.search(r"\b(?:la doctrina ha expresado|seg[uú]n la doctrina)\b", p, re.I):
+        return "DOCTRINAL_QUOTATION_REVIEW", ["doctrine_citation"]
+    if DISPOSITIVE_INTRO.match(p) or re.match(r"^(?:PRIMERO|SEGUNDO|TERCERO)\s*:\s*(?:CASA|RECHAZA|ACOGE|DECLARA)", p, re.I):
+        return "DISPOSITIVE_REVIEW", ["dispositive"]
+    if REVIEWED_COURT_INTRO.search(p):
+        indicators.append("explicit_deciding_court_reference")
+    if re.search(r"\b(?:la corte a qua no verific[oó]|la corte a qua incurri[oó]|la sentencia impugnada pone de manifiesto)\b", p, re.I):
+        indicators.append("cassation_review_of_lower_court")
+    if indicators:
+        return "POSSIBLE_JUDICIAL_REASONING_REVIEW", indicators
     return "UNDETERMINED_REQUIRES_CONTEXT", []
 
 
-def score_passage(passage: str, issue: str | None):
-    score = 0.0
-    if issue:
-        it, pt = tokenize(issue), tokenize(passage)
-        if it: score += 5.0 * len(it & pt) / len(it)
-    pf = fold(passage)
-    for marker in ["esta sala", "este tribunal", "considerando", "por cuanto", "en ese sentido", "ha establecido", "criterio", "precedente", "en consecuencia", "procede", "responsabilidad", "vulneracion", "violacion"]:
-        if marker in pf: score += 0.4
-    attribution, _ = classify_passage(passage)
-    if attribution == "PARTY_ARGUMENT_OR_MIXED_REVIEW": score -= 2.0
-    elif attribution == "POSSIBLE_JUDICIAL_REASONING_REVIEW": score += 1.2
-    if len(passage) < 140: score -= 0.4
+def classify_passage(passage: str, context: str = "") -> tuple[str, list[str]]:
+    return attribution_context(passage, context)
+
+def score_passage(passage: str, issue: str | None, attribution: str | None = None):
+    attribution = attribution or classify_passage(passage)[0]
+    it, pt = tokenize(issue), tokenize(passage)
+    score = 5.0 * len(it & pt) / len(it) if it else 0.0
+    score += {
+        "POSSIBLE_JUDICIAL_REASONING_REVIEW": 2.0,
+        "LOWER_COURT_QUOTATION_REVIEW": -2.0,
+        "PARTY_ARGUMENT_OR_MIXED_REVIEW": -2.0,
+        "DOCTRINAL_QUOTATION_REVIEW": -1.5,
+        "DISPOSITIVE_REVIEW": 0.0,
+        "UNDETERMINED_REQUIRES_CONTEXT": -1.5,
+    }.get(attribution, 0.0)
+    if len(passage) < 120: score -= 0.5
     return score
 
 def validate_official_url(url: str):
@@ -217,7 +266,7 @@ async def fetch_document(url: str):
     current = url
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(35, connect=10), follow_redirects=False,
-                                     headers={"User-Agent": "ELCOHE-JURIS-RD/1.5.3"}, trust_env=False) as client:
+                                     headers={"User-Agent": "ELCOHE-JURIS-RD/1.5.4"}, trust_env=False) as client:
             for hop in range(MAX_REDIRECTS + 1):
                 validate_official_url(current)
                 async with client.stream("GET", current) as response:
@@ -273,26 +322,103 @@ def extract_document_text(doc):
         return {"document_type":"HTML","pages":[{"page":1,"text":text}],"full_text":text,"page_count":1,"extraction_ok":bool(text.strip())}
     raise HTTPException(415, f"Tipo no compatible: {ct or 'desconocido'}")
 
-def find_relevant_passages(pages, issue, limit):
-    cands=[]
-    for po in pages:
-        for unit in split_units(clean_page_text(po["text"])):
-            s = score_passage(unit, issue)
-            if s <= 0: continue
-            attribution, markers = classify_passage(unit)
-            cands.append({
-                "page": po["page"], "score": round(s, 3),
-                "text": unit[:1800], "attribution": attribution,
-                "attribution_indicators": markers,
-                "review_required": True,
-            })
-    cands.sort(key=lambda x: (-x["score"], x["page"]))
+def extract_numbered_foundations(pages: list[dict], court: str | None = None) -> list[dict]:
+    """Preserve cross-page units and track section headings; no implicit court attribution."""
+    units=[]; current=None; section="UNDETERMINED"
+    for page in pages:
+        cleaned=strip_running_furniture(page["text"])
+        # TC repeats case captions and pagination at the foot of every page.
+        cleaned=re.sub(r"(?im)^\s*Expediente n[úu]m\..*?(?=\n|$)", "", cleaned)
+        for line in cleaned.splitlines():
+            line=line.strip()
+            if not line: continue
+            fl=fold(line)
+            if court=="TC":
+                if "ii. consideraciones y fundamentos" in fl: section="DECIDING_COURT";continue
+                if section=="DECIDING_COURT" and "del tribunal constitucional"==fl:continue
+                if re.match(r"^i\.\s*antecedentes", fl): section="BACKGROUND";continue
+                if fl=="decide:": section="DISPOSITIVE";continue
+            elif court=="SCJ":
+                if re.search(r"la (?:primera|segunda|tercera) sala, (?:despues|luego) de haber deliberado", fl): section="DECIDING_COURT";continue
+                if fl in ("falla:","decide:"): section="DISPOSITIVE";continue
+            if court=="TC":
+                # Only TC judicial numbered paragraphs in the court's own section.
+                m=re.match(r"^(\d{1,2}\.\d{1,2})\.\s+",line) if section=="DECIDING_COURT" else None
+                if m is None and section=="DECIDING_COURT":
+                    m=re.match(r"^(\d{1,2})\.\s+(?=[A-ZÁÉÍÓÚÑ])",line)
+            else:
+                m=re.match(r"^(\d{1,3})[).]\s+",line) if section=="DECIDING_COURT" else None
+            if m:
+                if current: units.append(current)
+                current={"foundation_number":m.group(1),"page":page["page"],
+                         "end_page":page["page"],"lines":[line],"section":section}
+            elif current and section==current["section"]:
+                current["lines"].append(line);current["end_page"]=page["page"]
+    if current: units.append(current)
+    for u in units:u["text"]=normalize_space(" ".join(u.pop("lines")))
+    return units
+
+
+def annotate_foundation_attribution(units: list[dict], court: str | None = None) -> list[dict]:
+    """Track nested quotations and party submissions; prefer uncertainty to false attribution."""
+    quoted=False
+    for u in units:
+        txt=u["text"]
+        if u.get("section")!="DECIDING_COURT":
+            u["attribution"]="NON_DECIDING_SECTION_REVIEW";u["attribution_indicators"]=["section_not_deciding_court"];continue
+        if court=="TC":
+            # TC reasons may quote SCJ, parties or jurisprudence. They remain mixed until reviewed.
+            attr, indicators=attribution_context(txt)
+            if attr=="UNDETERMINED_REQUIRES_CONTEXT":
+                attr="DECIDING_COURT_SECTION_REVIEW";indicators=["tc_own_considerations_section","requires_individual_review"]
+            u["attribution"]=attr;u["attribution_indicators"]=indicators;continue
+        # Explicit opening and closure of reproduced appellate reasoning.
+        if re.search(r"(?:ordenanza|sentencia|fallo)\s+(?:impugnada|recurrida).{0,100}(?:transcriben|transcribe|textualmente)|(?:la alzada|la corte a qua).{0,110}(?:transcri|motiv[oó].{0,30}siguientes)",txt,re.I):
+            quoted=True;u["attribution"]="LOWER_COURT_INTRODUCTION_REVIEW";u["attribution_indicators"]=["explicit_lower_court_quote_start"];continue
+        if quoted and re.search(r"^(?:\d+[).]\s+)?(?:seg[uú]n resulta del an[aá]lisis|de lo transcrito|de la transcripci[oó]n|del examen de la sentencia impugnada|del contenido de la sentencia impugnada|de la lectura de la sentencia impugnada)",txt[:250],re.I):
+            quoted=False
+            u["attribution"]="DECIDING_COURT_NARRATIVE_REVIEW";u["attribution_indicators"]=["explicit_quote_scope_exit"];continue
+        if quoted:
+            u["attribution"]="LOWER_COURT_QUOTATION_REVIEW";u["attribution_indicators"]=["within_lower_court_quotation_scope"];continue
+        attr, indicators=attribution_context(txt)
+        if attr=="UNDETERMINED_REQUIRES_CONTEXT":
+            attr="DECIDING_COURT_SECTION_REVIEW";indicators=["scj_deliberation_section","requires_individual_review"]
+        u["attribution"]=attr;u["attribution_indicators"]=indicators
+    return units
+
+
+def find_relevant_passages(pages, issue, limit, court=None):
+    units = annotate_foundation_attribution(extract_numbered_foundations(pages, court), court)
+    candidates = []
+    for i, unit in enumerate(units):
+        attr = unit["attribution"]
+        score = score_passage(unit["text"], issue, attr)
+        if attr in ("DECIDING_COURT_SECTION_REVIEW", "DECIDING_COURT_NARRATIVE_REVIEW"):
+            score += 0.8
+        if attr.startswith("LOWER_COURT_"):
+            score -= 2.5
+        if score <= 0: continue
+        preceding = units[i-1]["text"] if i else ""
+        following = units[i+1]["text"] if i+1 < len(units) else ""
+        candidates.append({
+            "page":unit["page"], "end_page":unit["end_page"],
+            "foundation_number":unit["foundation_number"],
+            "score":round(score,3), "text":unit["text"][:1800],
+            "text_truncated":len(unit["text"])>1800,
+            "attribution":attr, "attribution_indicators":unit["attribution_indicators"],
+            "preceding_context":preceding[-500:] or None,
+            "following_context":following[:500] or None,
+            "attribution_is_determinative":False,
+            "ratio_decidendi_verified":False,
+            "review_required":True,
+        })
+    candidates.sort(key=lambda x:(-x["score"],x["page"]))
     out=[]; seen=set()
-    for c in cands:
-        k=fold(c["text"][:300])
-        if k in seen: continue
-        seen.add(k); out.append(c)
-        if len(out)>=limit: break
+    for c in candidates:
+        key=(c["foundation_number"], c["page"])
+        if key in seen:continue
+        seen.add(key);out.append(c)
+        if len(out)>=limit:break
     return out
 
 def normalized_contains(haystack, needle): return fold(needle) in fold(haystack)
@@ -343,7 +469,7 @@ async def analyze_official_decision(req:AnalyzeDecisionRequest):
     doc=await fetch_document(str(req.url)); ex=extract_document_text(doc); court=detect_court(doc["host"],req.expected_court,ex["full_text"]); meta=extract_metadata_from_text(ex["full_text"],court)
     expected_match=decision_number_matches(ex["full_text"],court,req.expected_number)
     court_ok=court_matches(court,req.expected_court)
-    passages=find_relevant_passages(ex["pages"],req.legal_issue,req.max_passages)
+    passages=find_relevant_passages(ex["pages"],req.legal_issue,req.max_passages,court)
     for passage in passages:
         passage.update(context_for_page(ex["pages"],passage["page"]))
     status="HOLDING_CANDIDATE" if ex["extraction_ok"] and court_ok and expected_match and passages else ("VERIFIED_SOURCE" if ex["extraction_ok"] and court_ok and expected_match else "NOT_VERIFIED")
@@ -364,9 +490,18 @@ async def promote_verified_holding(req:HoldingPromotionRequest):
         support_exact=normalized_contains(page_text,req.support_quote)
         issue_score=overlap_ratio(req.legal_issue,req.support_quote)
         prop_score=overlap_ratio(req.legal_proposition,req.support_quote)
-    attribution, attribution_indicators = classify_passage(req.support_quote)
+    support_page_text = ex["pages"][req.support_page-1]["text"] if page_ok else ""
+    units_on_page = split_units(support_page_text) if page_ok else []
+    support_index = next((i for i,u in enumerate(units_on_page) if normalized_contains(u, req.support_quote)), None)
+    preceding = units_on_page[support_index-1] if support_index is not None and support_index > 0 else ""
+    # Assess the full containing unit, not just a cherry-picked support quote.
+    support_unit = units_on_page[support_index] if support_index is not None else ""
+    attribution, attribution_indicators = attribution_context(support_unit or req.support_quote, preceding)
     gates["support_attribution_heuristic"] = attribution
+    gates["support_unit_located"] = support_index is not None
+    gates["support_context_preceding"] = preceding[-500:] if preceding else None
     gates["support_attribution_indicators"] = attribution_indicators
+    gates["support_unit_text_truncated"] = len(support_unit) > 1800
     gates["support_quote_exact_on_page"]=support_exact
     gates["issue_grounding_score"]=round(issue_score,3)
     gates["proposition_grounding_score"]=round(prop_score,3)
@@ -380,6 +515,7 @@ async def promote_verified_holding(req:HoldingPromotionRequest):
     if not req.judicial_reasoning_reviewed: reasons.append("Falta revisión humana de autoría y contexto del fundamento.")
     if not number_ok: reasons.append("Número esperado no confirmado.")
     if not support_exact: reasons.append("Pasaje no encontrado íntegramente en la página indicada.")
+    if support_index is None: reasons.append("La cita no pudo vincularse a una unidad argumentativa completa.")
     if attribution != "POSSIBLE_JUDICIAL_REASONING_REVIEW": reasons.append("No se acreditó atribución judicial positiva mediante los indicios disponibles; revisión de contexto necesaria.")
     reviewer_ok = bool(req.reviewer_name and req.reviewer_confirmation == "CONFIRMO_LECTURA_INTEGRAL")
     gates["reviewer_attestation"] = reviewer_ok
@@ -387,6 +523,7 @@ async def promote_verified_holding(req:HoldingPromotionRequest):
     if issue_score<0.15: reasons.append("Conexión insuficiente con la cuestión jurídica.")
     if prop_score<0.18: reasons.append("Anclaje insuficiente de la proposición en el pasaje.")
     if not outcome_ok: reasons.append("Resultado/dispositivo no verificado.")
-    ok=official and court_ok and req.judicial_reasoning_reviewed and number_ok and page_ok and support_exact and attribution == "POSSIBLE_JUDICIAL_REASONING_REVIEW" and reviewer_ok and issue_score>=0.15 and prop_score>=0.18 and outcome_ok
+    ok=official and court_ok and req.judicial_reasoning_reviewed and number_ok and page_ok and support_exact and support_index is not None and attribution == "POSSIBLE_JUDICIAL_REASONING_REVIEW" and reviewer_ok and issue_score>=0.15 and prop_score>=0.18 and outcome_ok
     if not official: reasons.append("Documento oficial no confirmado o extracción insuficiente.")
-    return {"status":"VERIFIED_HOLDING" if ok else "HOLDING_NOT_PROMOTED","court":court,"metadata":meta,"legal_issue":req.legal_issue,"legal_proposition":req.legal_proposition if ok else None,"support":{"page":req.support_page,"quote":req.support_quote if support_exact else None,"outcome_page":req.outcome_page,"outcome_quote":req.outcome_quote if outcome_ok else None},"gates":gates,"reasons":reasons,"verification_note":"La confirmación automatizada de citas no sustituye la lectura jurídica humana del razonamiento y dispositivo.","source_url":doc["final_url"],"sha256":doc["sha256"]}
+    if ok: reasons.append("Los controles heurísticos no acreditan por sí solos la ratio decidendi; no se emite certificación automática.")
+    return {"status":"HOLDING_REQUIRES_INDEPENDENT_LEGAL_REVIEW" if ok else "HOLDING_NOT_PROMOTED","court":court,"metadata":meta,"legal_issue":req.legal_issue,"legal_proposition":None,"support":{"page":req.support_page,"quote":req.support_quote if support_exact else None,"outcome_page":req.outcome_page,"outcome_quote":req.outcome_quote if outcome_ok else None},"gates":gates,"reasons":reasons,"verification_note":"La verificación documental y los indicadores de atribución no prueban por sí mismos la ratio decidendi. Requiere juicio jurídico humano y cotejo del dispositivo.","source_url":doc["final_url"],"sha256":doc["sha256"]}
