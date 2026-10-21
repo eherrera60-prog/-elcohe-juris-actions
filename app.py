@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, HttpUrl, Field
 from pypdf import PdfReader
 
-APP_VERSION = "1.5.1"
+APP_VERSION = "1.5.2"
 TC_SEARCH_URL = "https://www.tribunalconstitucional.gob.do/consultas/secretar%C3%ADa/sentencias/"
 SCJ_PORTAL_URL = "https://consultasentenciascj.poderjudicial.gob.do/"
 ALLOWED_HOST_SUFFIXES = (
@@ -81,11 +81,10 @@ def court_matches(detected: str | None, expected: str | None) -> bool:
     return detected == expected.strip().upper()
 
 def clean_page_text(text: str) -> str:
-    # Remove repeated institutional headers/footers without deleting legal reasoning.
+    """Preserve paragraph boundaries; remove only identifiable short running headers."""
     text = re.sub(r"REP[ÚU]BLICA DOMINICANA\s+SUPREMA CORTE DE JUSTICIA\s+SCJ-[A-Z]{2}-\d{2}-\d{3,5}", " ", text, flags=re.I)
-    text = re.sub(r"Exp\.\s*n[úu]m\.\s*[A-Za-z0-9./-]+\s+Partes:.*?Decisi[oó]n:\s*[A-ZÁÉÍÓÚ]+", " ", text, flags=re.I)
-    text = re.sub(r"Av\. Enrique Jim[eé]nez Moya.*?(?:P[aá]g\.\s*\d+)", " ", text, flags=re.I)
-    return normalize_space(text)
+    text = re.sub(r"Av\. Enrique Jim[eé]nez Moya[^\n]{0,180}P[aá]g\.\s*\d+", " ", text, flags=re.I)
+    return re.sub(r"[ \t]+", " ", text).strip()
 
 def context_for_page(pages: list[dict], page_number: int, window: int = 1) -> dict:
     """Return neighboring pages as context; not proof of authorship."""
@@ -108,13 +107,12 @@ def extract_metadata_from_text(text: str, court: str | None) -> dict[str, Any]:
         m = re.search(pat, sample, re.I)
         if m: meta["date"] = normalize_space(m.group(0)); break
     for pat in [
-        r"\b(?:expediente|exp\.)\s*(?:n[úu]m\.?|no\.?|n[°º]\.?)\s*[A-Za-z0-9./-]+",
-        r"\bTC-\d{2}-\d{4}-\d{4}\b",
+        r"\b(?:expediente|exp\.)\s*(?:n[úu]m\.?|no\.?|n[°º]\.?)\s*[:#-]?\s*([A-Za-z0-9][A-Za-z0-9./-]{5,})",
+        r"\b(TC-\d{2}-\d{4}-\d{4})\b",
     ]:
         m = re.search(pat, sample, re.I)
         if m:
-            raw = normalize_space(m.group(0))
-            meta["case_number"] = re.sub(r"^(?:expediente|exp\.)\s*(?:n[úu]m\.?|no\.?|n[°º]\.?)\s*", "", raw, flags=re.I)
+            meta["case_number"] = m.group(1).rstrip(".,;")
             break
     for pat in [r"\bPrimera Sala\b", r"\bSegunda Sala\b", r"\bTercera Sala\b", r"\bSalas Reunidas\b", r"\bPleno\b"]:
         m = re.search(pat, sample, re.I)
@@ -123,9 +121,41 @@ def extract_metadata_from_text(text: str, court: str | None) -> dict[str, Any]:
     return meta
 
 def split_units(text: str):
+    """Segment by numbered paragraphs and judicial transitions, not mere keywords."""
     text = re.sub(r"\r\n?", "\n", text)
-    parts = re.split(r"\n{2,}|(?<=[.;:])\s+(?=(?:Que|Considerando|Por cuanto|En ese sentido|Esta Sala|Este Tribunal)\b)", text, flags=re.I)
+    parts = re.split(
+        r"\n{2,}|\n(?=\s*\d{1,3}\.\s)|(?<=[.;:])\s+(?=(?:Que|Considerando|Por cuanto|En ese sentido|Esta Sala|Este Tribunal)\b)",
+        text, flags=re.I,
+    )
     return [normalize_space(p) for p in parts if len(normalize_space(p)) >= 80]
+
+
+def classify_passage(passage: str) -> tuple[str, list[str]]:
+    """Heuristic triage only. A marker is never proof of judicial authorship."""
+    p = fold(passage)
+    party_markers = (
+        "la parte recurrente", "la parte recurrida", "la recurrente sostiene",
+        "la recurrente alega", "la parte demandante", "la parte demandada",
+        "alega que", "argumenta que", "sostiene que", "aduce que",
+        "en su memorial", "en su escrito de defensa", "como medio de casacion",
+        "el recurrente sostiene", "el recurrente alega", "la apelante sostiene",
+    )
+    court_markers = (
+        "esta sala considera", "esta sala advierte", "esta sala estima",
+        "esta corte considera", "este tribunal considera", "esta jurisdiccion entiende",
+        "esta primera sala", "esta segunda sala", "esta tercera sala",
+        "esta sala ha juzgado", "esta sala ha establecido",
+        "por tales motivos", "por estas razones", "procede rechazar",
+        "procede casar", "se impone rechazar", "se impone casar",
+    )
+    found_party = [x for x in party_markers if x in p]
+    found_court = [x for x in court_markers if x in p]
+    if found_party:
+        return "PARTY_ARGUMENT_OR_MIXED_REVIEW", found_party[:4]
+    if found_court:
+        return "POSSIBLE_JUDICIAL_REASONING_REVIEW", found_court[:4]
+    return "UNDETERMINED_REQUIRES_CONTEXT", []
+
 
 def score_passage(passage: str, issue: str | None):
     score = 0.0
@@ -133,8 +163,11 @@ def score_passage(passage: str, issue: str | None):
         it, pt = tokenize(issue), tokenize(passage)
         if it: score += 5.0 * len(it & pt) / len(it)
     pf = fold(passage)
-    for marker in ["esta sala","este tribunal","tribunal constitucional","considerando","por cuanto","en ese sentido","ha establecido","criterio","precedente","en consecuencia","procede","responsabilidad","vulneracion","violacion"]:
+    for marker in ["esta sala", "este tribunal", "considerando", "por cuanto", "en ese sentido", "ha establecido", "criterio", "precedente", "en consecuencia", "procede", "responsabilidad", "vulneracion", "violacion"]:
         if marker in pf: score += 0.4
+    attribution, _ = classify_passage(passage)
+    if attribution == "PARTY_ARGUMENT_OR_MIXED_REVIEW": score -= 2.0
+    elif attribution == "POSSIBLE_JUDICIAL_REASONING_REVIEW": score += 1.2
     if len(passage) < 140: score -= 0.4
     return score
 
@@ -157,7 +190,7 @@ def extract_document_text(doc):
         reader = PdfReader(io.BytesIO(data))
         pages=[]
         for i,p in enumerate(reader.pages,1):
-            try: txt = normalize_space(p.extract_text() or "")
+            try: txt = (p.extract_text() or "").replace("\r\n", "\n")
             except Exception: txt = ""
             pages.append({"page":i,"text":txt})
         full = "\n\n".join(p["text"] for p in pages if p["text"])
@@ -173,8 +206,15 @@ def find_relevant_passages(pages, issue, limit):
     for po in pages:
         for unit in split_units(clean_page_text(po["text"])):
             s = score_passage(unit, issue)
-            if s>0: cands.append({"page":po["page"],"score":round(s,3),"text":unit[:1800],"attribution":"UNDETERMINED_REQUIRES_CONTEXT"})
-    cands.sort(key=lambda x:(-x["score"],x["page"]))
+            if s <= 0: continue
+            attribution, markers = classify_passage(unit)
+            cands.append({
+                "page": po["page"], "score": round(s, 3),
+                "text": unit[:1800], "attribution": attribution,
+                "attribution_indicators": markers,
+                "review_required": True,
+            })
+    cands.sort(key=lambda x: (-x["score"], x["page"]))
     out=[]; seen=set()
     for c in cands:
         k=fold(c["text"][:300])
@@ -235,7 +275,7 @@ async def analyze_official_decision(req:AnalyzeDecisionRequest):
     for passage in passages:
         passage.update(context_for_page(ex["pages"],passage["page"]))
     status="HOLDING_CANDIDATE" if ex["extraction_ok"] and court_ok and (expected_match is not False) and passages else ("VERIFIED_SOURCE" if ex["extraction_ok"] and court_ok and expected_match is not False else "NOT_VERIFIED")
-    return {"status":status,"official_source_verified":bool(ex["extraction_ok"] and court_ok and expected_match is not False),"expected_court_match":court_ok,"expected_number_match":expected_match,"metadata":meta,"relevant_passages":passages,"jurisprudential_card":{"tribunal":court,"sala":meta.get("chamber"),"sentencia":meta.get("decision_number"),"fecha":meta.get("date"),"expediente":meta.get("case_number"),"estado_verificacion":status,"cuestion_juridica":req.legal_issue,"fundamentos_candidatos":passages,"ratio_decidendi":None,"regla_juridica":None,"fuente_oficial":doc["final_url"],"paginas":ex["page_count"]},"source_url":doc["final_url"],"sha256":doc["sha256"]}
+    return {"status":status,"official_source_verified":bool(ex["extraction_ok"] and court_ok and expected_match is not False),"expected_court_match":court_ok,"expected_number_match":expected_match,"metadata":meta,"relevant_passages":passages,"jurisprudential_card":{"tribunal":court,"sala":meta.get("chamber"),"sentencia":meta.get("decision_number"),"fecha":meta.get("date"),"expediente":meta.get("case_number"),"estado_verificacion":status,"cuestion_juridica":req.legal_issue,"fundamentos_candidatos":passages,"ratio_decidendi":None,"regla_juridica":None,"review_required":True,"fuente_oficial":doc["final_url"],"paginas":ex["page_count"]},"source_url":doc["final_url"],"sha256":doc["sha256"]}
 
 @app.post("/v1/promote-holding", operation_id="promoteVerifiedHolding")
 async def promote_verified_holding(req:HoldingPromotionRequest):
@@ -252,6 +292,9 @@ async def promote_verified_holding(req:HoldingPromotionRequest):
         support_exact=normalized_contains(page_text,req.support_quote)
         issue_score=overlap_ratio(req.legal_issue,req.support_quote)
         prop_score=overlap_ratio(req.legal_proposition,req.support_quote)
+    attribution, attribution_indicators = classify_passage(req.support_quote)
+    gates["support_attribution_heuristic"] = attribution
+    gates["support_attribution_indicators"] = attribution_indicators
     gates["support_quote_exact_on_page"]=support_exact
     gates["issue_grounding_score"]=round(issue_score,3)
     gates["proposition_grounding_score"]=round(prop_score,3)
@@ -265,8 +308,9 @@ async def promote_verified_holding(req:HoldingPromotionRequest):
     if not req.judicial_reasoning_reviewed: reasons.append("Falta revisión humana de autoría y contexto del fundamento.")
     if not number_ok: reasons.append("Número esperado no confirmado.")
     if not support_exact: reasons.append("Pasaje no encontrado íntegramente en la página indicada.")
+    if attribution == "PARTY_ARGUMENT_OR_MIXED_REVIEW": reasons.append("La cita contiene indicadores de alegatos de parte; se requiere una cita inequívoca del razonamiento judicial.")
     if issue_score<0.15: reasons.append("Conexión insuficiente con la cuestión jurídica.")
     if prop_score<0.18: reasons.append("Anclaje insuficiente de la proposición en el pasaje.")
     if not outcome_ok: reasons.append("Resultado/dispositivo no verificado.")
-    ok=official and court_ok and req.judicial_reasoning_reviewed and number_ok and page_ok and support_exact and issue_score>=0.15 and prop_score>=0.18 and outcome_ok
+    ok=official and court_ok and req.judicial_reasoning_reviewed and number_ok and page_ok and support_exact and attribution != "PARTY_ARGUMENT_OR_MIXED_REVIEW" and issue_score>=0.15 and prop_score>=0.18 and outcome_ok
     return {"status":"VERIFIED_HOLDING" if ok else "HOLDING_NOT_PROMOTED","court":court,"metadata":meta,"legal_issue":req.legal_issue,"legal_proposition":req.legal_proposition if ok else None,"support":{"page":req.support_page,"quote":req.support_quote if support_exact else None,"outcome_page":req.outcome_page,"outcome_quote":req.outcome_quote if outcome_ok else None},"gates":gates,"reasons":reasons,"verification_note":"La confirmación automatizada de citas no sustituye la lectura jurídica humana del razonamiento y dispositivo.","source_url":doc["final_url"],"sha256":doc["sha256"]}
