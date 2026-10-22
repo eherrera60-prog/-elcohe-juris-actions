@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, HttpUrl, Field
 from pypdf import PdfReader
 
-APP_VERSION = "1.5.6"
+APP_VERSION = "1.5.7"
 MAX_DOCUMENT_BYTES = 12 * 1024 * 1024
 MAX_PDF_PAGES = 350
 MAX_REDIRECTS = 3
@@ -109,9 +109,31 @@ def court_matches(detected: str | None, expected: str | None) -> bool:
     return detected == expected.strip().upper()
 
 def clean_page_text(text: str) -> str:
-    """Preserve paragraph boundaries; remove only identifiable short running headers."""
-    text = re.sub(r"REP[ÚU]BLICA DOMINICANA\s+SUPREMA CORTE DE JUSTICIA\s+SCJ-[A-Z]{2}-\d{2}-\d{3,5}", " ", text, flags=re.I)
-    text = re.sub(r"Av\. Enrique Jim[eé]nez Moya[^\n]{0,180}P[aá]g\.\s*\d+", " ", text, flags=re.I)
+    """Remove identifiable SCJ running furniture, including mid-sentence insertions.
+
+    Keep substantive text and paragraph boundaries; never silently repair words.
+    """
+    text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    # SCJ footer can be injected in the middle of a judicial paragraph by pypdf.
+    # Match the complete identifying footer rather than deleting arbitrary lines.
+    text = re.sub(
+        r"SCJ-[A-Z]{2}-\d{2}-\d{3,5}\s+Nacional,\s*Rep\.?\s*Dom\.?\s*"
+        r"Tel\.?\s*:\s*\(?\d{3}\)?\s*\d{3}[-–]\d{4}\s*[•·]?\s*"
+        r"Direcci[oó]n\s+de\s+Internet\s*:\s*https?\s*:\s*//\s*"
+        r"(?:www\.)?poderjudicial\.gob\.do\s*PR\s*/\s*p[aá]g\.?\s*\d+",
+        " ", text, flags=re.I,
+    )
+    # Other full footer variants (where the decision number is not repeated).
+    text = re.sub(
+        r"(?:Av\.?\s*Enrique\s+Jim[eé]nez\s+Moya[^\n]{0,140})?"
+        r"Nacional,\s*Rep\.?\s*Dom\.?\s*Tel\.?\s*:\s*"
+        r"\(?\d{3}\)?\s*\d{3}[-–]\d{4}\s*[•·]?\s*"
+        r"Direcci[oó]n\s+de\s+Internet\s*:\s*https?\s*:\s*//\s*"
+        r"(?:www\.)?poderjudicial\.gob\.do\s*PR\s*/\s*p[aá]g\.?\s*\d+",
+        " ", text, flags=re.I,
+    )
+    text = re.sub(r"(?im)^\s*(?:REP[ÚU]BLICA DOMINICANA|SUPREMA CORTE DE JUSTICIA)\s*$", "", text)
+    text = re.sub(r"(?im)^\s*(?:Av\.?\s*Enrique Jim[eé]nez Moya|Direcci[oó]n de Internet:|Tel\.:|PR/p[aá]g\.)[^\n]*$", "", text)
     return re.sub(r"[ \t]+", " ", text).strip()
 
 def context_for_page(pages: list[dict], page_number: int, window: int = 1) -> dict:
@@ -177,16 +199,12 @@ DISPOSITIVE_INTRO = re.compile(r"^\s*(?:FALLA|DECIDE|RESUELVE)\s*:?\s*$", re.I)
 NUMBERED_START = re.compile(r"(?m)^\s*\d{1,3}[).]\s+")
 
 def strip_running_furniture(text: str) -> str:
-    # Strip only recurrent page furniture; do not collapse substantive paragraphs.
-    lines = text.splitlines()
+    # Apply the same cleanup to analysis and promotion; preserve line breaks.
+    text = clean_page_text(text)
     kept = []
-    for line in lines:
+    for line in text.splitlines():
         t = normalize_space(line)
-        if re.match(r"^(?:Av\. Enrique Jim[eé]nez Moya|Direcci[oó]n de Internet:|Tel\.:)", t, re.I):
-            continue
         if re.match(r"^(?:Exp\. n[uú]m\.|Partes:|Materia:|Decisi[oó]n:|Ponente:|WT/|P[aá]g\.\s*\d+)", t, re.I):
-            continue
-        if re.match(r"^(?:REP[ÚU]BLICA DOMINICANA|SUPREMA CORTE DE JUSTICIA|TRIBUNAL CONSTITUCIONAL)$", t, re.I):
             continue
         kept.append(line)
     return "\n".join(kept)
@@ -312,7 +330,7 @@ async def fetch_document(url: str):
     current = url
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(35, connect=10), follow_redirects=False,
-                                     headers={"User-Agent": "ELCOHE-JURIS-RD/1.5.6"}, trust_env=False) as client:
+                                     headers={"User-Agent": "ELCOHE-JURIS-RD/1.5.7"}, trust_env=False) as client:
             for hop in range(MAX_REDIRECTS + 1):
                 validate_official_url(current)
                 async with client.stream("GET", current) as response:
@@ -533,7 +551,7 @@ async def promote_verified_holding(req:HoldingPromotionRequest):
     support_exact=False; issue_score=0.0; prop_score=0.0
     if page_ok:
         page_text=ex["pages"][req.support_page-1]["text"]
-        support_exact=normalized_contains(page_text,req.support_quote)
+        support_exact=normalized_contains(page_text,req.support_quote) or normalized_contains(strip_running_furniture(page_text),req.support_quote)
         issue_score=overlap_ratio(req.legal_issue,req.support_quote)
         prop_score=overlap_ratio(req.legal_proposition,req.support_quote)
     context = locate_support_context(ex["pages"], req.support_page, req.support_quote)
@@ -543,9 +561,14 @@ async def promote_verified_holding(req:HoldingPromotionRequest):
     support_unit = context["unit"]
     preceding = context["preceding"]
     following = context["following"]
-    attribution, attribution_indicators = attribution_context(
-        support_unit or req.support_quote, preceding, following
-    )
+    # A quotation that cannot be anchored to the declared page must not
+    # receive a positive authorship signal solely from the supplied input.
+    if support_located:
+        attribution, attribution_indicators = attribution_context(
+            support_unit, preceding, following
+        )
+    else:
+        attribution, attribution_indicators = "UNDETERMINED_REQUIRES_CONTEXT", ["support_unit_not_located"]
     gates["support_attribution_heuristic"] = attribution
     gates["support_unit_located"] = support_located
     gates["support_context_preceding"] = preceding[-500:] if preceding else None
@@ -555,6 +578,8 @@ async def promote_verified_holding(req:HoldingPromotionRequest):
     gates["support_attribution_indicators"] = attribution_indicators
     gates["support_unit_text_truncated"] = len(support_unit) > 1800
     gates["support_quote_exact_on_page"]=support_exact
+    gates["support_quote_raw_match"]=normalized_contains(ex["pages"][req.support_page-1]["text"], req.support_quote) if page_ok else False
+    gates["support_quote_cleaned_match"]=normalized_contains(strip_running_furniture(ex["pages"][req.support_page-1]["text"]), req.support_quote) if page_ok else False
     gates["issue_grounding_score"]=round(issue_score,3)
     gates["proposition_grounding_score"]=round(prop_score,3)
     outcome_ok=bool(req.outcome_quote and req.outcome_page)
