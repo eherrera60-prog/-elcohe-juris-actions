@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, HttpUrl, Field
 from pypdf import PdfReader
 
-APP_VERSION = "1.5.4"
+APP_VERSION = "1.5.5"
 MAX_DOCUMENT_BYTES = 12 * 1024 * 1024
 MAX_PDF_PAGES = 350
 MAX_REDIRECTS = 3
@@ -202,32 +202,41 @@ def split_units(text: str):
 
 
 def attribution_context(passage: str, preceding: str = "", following: str = "") -> tuple[str, list[str]]:
-    """Classify with precedence for lower-court quotations and mixed excerpts.
-
-    A positive judicial marker is a *candidate*, never proof of ratio decidendi.
-    """
+    """Clasificación conservadora; contexto no sustituye revisión jurídica humana."""
     p = normalize_space(passage)
     prior = normalize_space(preceding)
-    following = normalize_space(following)
+    nxt = normalize_space(following)
     indicators = []
-    # Introductory framing from an earlier numbered unit can govern the quote.
+    # Prioridad de exclusiones: nunca promocionar argumentos o citas ajenas.
     quote_intro = QUOTED_LOWER_COURT.search(p) or QUOTED_LOWER_COURT.search(prior[-650:])
     if quote_intro:
         return "LOWER_COURT_QUOTATION_REVIEW", ["lower_court_quotation_or_intro"]
-    if PARTY_INTRO.search(p) or re.search(r"(?:en su memorial de casaci[oó]n|la parte recurrente sostiene)", p, re.I):
+    if PARTY_INTRO.search(p) or re.search(r"(?:en su memorial de casaci[oó]n|la parte recurrente sostiene)", prior[-450:], re.I):
         return "PARTY_ARGUMENT_OR_MIXED_REVIEW", ["party_argument_or_mixed"]
     if re.search(r"\b(?:la doctrina ha expresado|seg[uú]n la doctrina)\b", p, re.I):
         return "DOCTRINAL_QUOTATION_REVIEW", ["doctrine_citation"]
-    if DISPOSITIVE_INTRO.match(p) or re.match(r"^(?:PRIMERO|SEGUNDO|TERCERO)\s*:\s*(?:CASA|RECHAZA|ACOGE|DECLARA)", p, re.I):
+    if DISPOSITIVE_INTRO.match(p) or re.match(r"^(?:PRIMERO|SEGUNDO|TERCERO)\s*:", p, re.I):
         return "DISPOSITIVE_REVIEW", ["dispositive"]
+    # Marcador judicial positivo explícito: candidato, no prueba concluyente.
     if REVIEWED_COURT_INTRO.search(p):
         indicators.append("explicit_deciding_court_reference")
-    if re.search(r"\b(?:la corte a qua no verific[oó]|la corte a qua incurri[oó]|la sentencia impugnada pone de manifiesto)\b", p, re.I):
-        indicators.append("cassation_review_of_lower_court")
-    if indicators:
+    if re.search(r"\b(?:esta sala|esta suprema corte|este tribunal|esta corte de casaci[oó]n)\b", p, re.I):
+        indicators.append("court_self_reference")
+    # La continuidad argumentativa es solo señal de revisión, nunca prueba
+    # suficiente para atribución judicial positiva.
+    if re.search(r"\b(?:en primer orden|esto se debe a que|en ese sentido|por consiguiente|en consecuencia)\b", p, re.I):
+        indicators.append("argumentative_continuity")
+    if re.search(r"\b(?:esta decisi[oó]n|consideraciones que se exponen en lo adelante)\b", prior[-650:], re.I):
+        indicators.append("preceding_judicial_context_candidate")
+    if re.search(r"\b(?:en consecuencia|por tanto|as[ií] las cosas)\b", nxt[:400], re.I):
+        indicators.append("following_argumentative_context")
+    if "explicit_deciding_court_reference" in indicators or "court_self_reference" in indicators:
         return "POSSIBLE_JUDICIAL_REASONING_REVIEW", indicators
-    return "UNDETERMINED_REQUIRES_CONTEXT", []
-
+    # Caso de continuidad: requiere dos señales independientes; siempre es
+    # una hipótesis sujeta a revisión, no una atribución certificada.
+    if "argumentative_continuity" in indicators and "preceding_judicial_context_candidate" in indicators:
+        return "POSSIBLE_JUDICIAL_REASONING_REVIEW", indicators
+    return "UNDETERMINED_REQUIRES_CONTEXT", indicators
 
 def classify_passage(passage: str, context: str = "") -> tuple[str, list[str]]:
     return attribution_context(passage, context)
