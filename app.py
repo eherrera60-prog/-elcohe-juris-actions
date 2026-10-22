@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, HttpUrl, Field
 from pypdf import PdfReader
 
-APP_VERSION = "1.5.5"
+APP_VERSION = "1.5.6"
 MAX_DOCUMENT_BYTES = 12 * 1024 * 1024
 MAX_PDF_PAGES = 350
 MAX_REDIRECTS = 3
@@ -201,6 +201,43 @@ def split_units(text: str):
     return [normalize_space(part) for part in parts if normalize_space(part)]
 
 
+
+def locate_support_context(pages: list[dict], support_page: int, support_quote: str) -> dict:
+    """Anchor the quote on its declared page; read adjacent pages for context only.
+
+    A quote on another page must never satisfy the declared-page check.
+    Page furniture is removed by split_units; context is not proof of authorship.
+    """
+    empty = {"located": False, "unit": "", "preceding": "", "following": "",
+             "preceding_page": None, "following_page": None}
+    if not (1 <= support_page <= len(pages)):
+        return empty
+
+    current = split_units(pages[support_page - 1]["text"])
+    index = next((i for i, unit in enumerate(current)
+                  if normalized_contains(unit, support_quote)), None)
+    if index is None:
+        return empty
+
+    preceding = current[index - 1] if index > 0 else ""
+    following = current[index + 1] if index + 1 < len(current) else ""
+    preceding_page = support_page if preceding else None
+    following_page = support_page if following else None
+
+    if not preceding and support_page > 1:
+        previous = split_units(pages[support_page - 2]["text"])
+        if previous:
+            preceding, preceding_page = previous[-1], support_page - 1
+    if not following and support_page < len(pages):
+        next_units = split_units(pages[support_page]["text"])
+        if next_units:
+            following, following_page = next_units[0], support_page + 1
+
+    return {"located": True, "unit": current[index], "preceding": preceding,
+            "following": following, "preceding_page": preceding_page,
+            "following_page": following_page}
+
+
 def attribution_context(passage: str, preceding: str = "", following: str = "") -> tuple[str, list[str]]:
     """Clasificación conservadora; contexto no sustituye revisión jurídica humana."""
     p = normalize_space(passage)
@@ -275,7 +312,7 @@ async def fetch_document(url: str):
     current = url
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(35, connect=10), follow_redirects=False,
-                                     headers={"User-Agent": "ELCOHE-JURIS-RD/1.5.4"}, trust_env=False) as client:
+                                     headers={"User-Agent": "ELCOHE-JURIS-RD/1.5.6"}, trust_env=False) as client:
             for hop in range(MAX_REDIRECTS + 1):
                 validate_official_url(current)
                 async with client.stream("GET", current) as response:
@@ -499,16 +536,22 @@ async def promote_verified_holding(req:HoldingPromotionRequest):
         support_exact=normalized_contains(page_text,req.support_quote)
         issue_score=overlap_ratio(req.legal_issue,req.support_quote)
         prop_score=overlap_ratio(req.legal_proposition,req.support_quote)
-    support_page_text = ex["pages"][req.support_page-1]["text"] if page_ok else ""
-    units_on_page = split_units(support_page_text) if page_ok else []
-    support_index = next((i for i,u in enumerate(units_on_page) if normalized_contains(u, req.support_quote)), None)
-    preceding = units_on_page[support_index-1] if support_index is not None and support_index > 0 else ""
-    # Assess the full containing unit, not just a cherry-picked support quote.
-    support_unit = units_on_page[support_index] if support_index is not None else ""
-    attribution, attribution_indicators = attribution_context(support_unit or req.support_quote, preceding)
+    context = locate_support_context(ex["pages"], req.support_page, req.support_quote)
+    support_located = context["located"]
+    # Assess the full unit, not a cherry-picked excerpt. Context never
+    # substitutes for the quote's exact presence on the declared page.
+    support_unit = context["unit"]
+    preceding = context["preceding"]
+    following = context["following"]
+    attribution, attribution_indicators = attribution_context(
+        support_unit or req.support_quote, preceding, following
+    )
     gates["support_attribution_heuristic"] = attribution
-    gates["support_unit_located"] = support_index is not None
+    gates["support_unit_located"] = support_located
     gates["support_context_preceding"] = preceding[-500:] if preceding else None
+    gates["support_context_following"] = following[:500] if following else None
+    gates["support_context_preceding_page"] = context["preceding_page"]
+    gates["support_context_following_page"] = context["following_page"]
     gates["support_attribution_indicators"] = attribution_indicators
     gates["support_unit_text_truncated"] = len(support_unit) > 1800
     gates["support_quote_exact_on_page"]=support_exact
@@ -524,7 +567,7 @@ async def promote_verified_holding(req:HoldingPromotionRequest):
     if not req.judicial_reasoning_reviewed: reasons.append("Falta revisión humana de autoría y contexto del fundamento.")
     if not number_ok: reasons.append("Número esperado no confirmado.")
     if not support_exact: reasons.append("Pasaje no encontrado íntegramente en la página indicada.")
-    if support_index is None: reasons.append("La cita no pudo vincularse a una unidad argumentativa completa.")
+    if not support_located: reasons.append("La cita no pudo vincularse a una unidad argumentativa completa.")
     if attribution != "POSSIBLE_JUDICIAL_REASONING_REVIEW": reasons.append("No se acreditó atribución judicial positiva mediante los indicios disponibles; revisión de contexto necesaria.")
     reviewer_ok = bool(req.reviewer_name and req.reviewer_confirmation == "CONFIRMO_LECTURA_INTEGRAL")
     gates["reviewer_attestation"] = reviewer_ok
@@ -532,7 +575,7 @@ async def promote_verified_holding(req:HoldingPromotionRequest):
     if issue_score<0.15: reasons.append("Conexión insuficiente con la cuestión jurídica.")
     if prop_score<0.18: reasons.append("Anclaje insuficiente de la proposición en el pasaje.")
     if not outcome_ok: reasons.append("Resultado/dispositivo no verificado.")
-    ok=official and court_ok and req.judicial_reasoning_reviewed and number_ok and page_ok and support_exact and support_index is not None and attribution == "POSSIBLE_JUDICIAL_REASONING_REVIEW" and reviewer_ok and issue_score>=0.15 and prop_score>=0.18 and outcome_ok
+    ok=official and court_ok and req.judicial_reasoning_reviewed and number_ok and page_ok and support_exact and support_located and attribution == "POSSIBLE_JUDICIAL_REASONING_REVIEW" and reviewer_ok and issue_score>=0.15 and prop_score>=0.18 and outcome_ok
     if not official: reasons.append("Documento oficial no confirmado o extracción insuficiente.")
     if ok: reasons.append("Los controles heurísticos no acreditan por sí solos la ratio decidendi; no se emite certificación automática.")
     return {"status":"HOLDING_REQUIRES_INDEPENDENT_LEGAL_REVIEW" if ok else "HOLDING_NOT_PROMOTED","court":court,"metadata":meta,"legal_issue":req.legal_issue,"legal_proposition":None,"support":{"page":req.support_page,"quote":req.support_quote if support_exact else None,"outcome_page":req.outcome_page,"outcome_quote":req.outcome_quote if outcome_ok else None},"gates":gates,"reasons":reasons,"verification_note":"La verificación documental y los indicadores de atribución no prueban por sí mismos la ratio decidendi. Requiere juicio jurídico humano y cotejo del dispositivo.","source_url":doc["final_url"],"sha256":doc["sha256"]}
