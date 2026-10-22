@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, HttpUrl, Field
 from pypdf import PdfReader
 
-APP_VERSION = "1.5.7"
+APP_VERSION = "1.5.8"
 MAX_DOCUMENT_BYTES = 12 * 1024 * 1024
 MAX_PDF_PAGES = 350
 MAX_REDIRECTS = 3
@@ -387,39 +387,79 @@ def extract_document_text(doc):
     raise HTTPException(415, f"Tipo no compatible: {ct or 'desconocido'}")
 
 def extract_numbered_foundations(pages: list[dict], court: str | None = None) -> list[dict]:
-    """Preserve cross-page units and track section headings; no implicit court attribution."""
-    units=[]; current=None; section="UNDETERMINED"
+    """Recover numbered reasons across pages, including PDF inline boundaries.
+
+    This is an extraction aid, NOT proof of judicial authorship. Never
+    attribute holdings without subsequent human review of the original PDF.
+    """
+    units = []
+    current = None
+    section = "UNDETERMINED"
     for page in pages:
-        cleaned=strip_running_furniture(page["text"])
-        # TC repeats case captions and pagination at the foot of every page.
-        cleaned=re.sub(r"(?im)^\s*Expediente n[úu]m\..*?(?=\n|$)", "", cleaned)
+        cleaned = strip_running_furniture(page["text"])
+        cleaned = re.sub(r"(?im)^\s*Expediente n[úu]m\..*?(?=\n|$)", "", cleaned)
+        # pypdf sometimes joins numbered paragraphs on the same line.
+        # Only split after punctuation and an uppercase initial; avoid article
+        # numbers, decimal quantities, and citations inside sentences.
+        cleaned = re.sub(
+            r"(?<=[.!?;:])([ \t]+)(?=\d{1,3}[).][ \t]+[A-ZÁÉÍÓÚÑ])",
+            "\n", cleaned,
+        )
         for line in cleaned.splitlines():
-            line=line.strip()
-            if not line: continue
-            fl=fold(line)
-            if court=="TC":
-                if "ii. consideraciones y fundamentos" in fl: section="DECIDING_COURT";continue
-                if section=="DECIDING_COURT" and "del tribunal constitucional"==fl:continue
-                if re.match(r"^i\.\s*antecedentes", fl): section="BACKGROUND";continue
-                if fl=="decide:": section="DISPOSITIVE";continue
-            elif court=="SCJ":
-                if re.search(r"la (?:primera|segunda|tercera) sala, (?:despues|luego) de haber deliberado", fl): section="DECIDING_COURT";continue
-                if fl in ("falla:","decide:"): section="DISPOSITIVE";continue
-            if court=="TC":
-                # Only TC judicial numbered paragraphs in the court's own section.
-                m=re.match(r"^(\d{1,2}\.\d{1,2})\.\s+",line) if section=="DECIDING_COURT" else None
-                if m is None and section=="DECIDING_COURT":
-                    m=re.match(r"^(\d{1,2})\.\s+(?=[A-ZÁÉÍÓÚÑ])",line)
+            line = line.strip()
+            if not line:
+                continue
+            fl = fold(line)
+            if court == "TC":
+                if "ii. consideraciones y fundamentos" in fl:
+                    section = "DECIDING_COURT"
+                    continue
+                if section == "DECIDING_COURT" and fl == "del tribunal constitucional":
+                    continue
+                if re.match(r"^i\.\s*antecedentes", fl):
+                    section = "BACKGROUND"
+                    continue
+                if fl.startswith("decide:"):
+                    if current:
+                        units.append(current)
+                        current = None
+                    section = "DISPOSITIVE"
+                    continue
+            elif court == "SCJ":
+                # The deliberation heading can be split across lines or can
+                # omit the literal 'la Primera Sala, después de haber'.
+                if ("despues de haber deliberado" in fl or
+                    "luego de haber deliberado" in fl or
+                    "la sala, despues de deliberar" in fl):
+                    section = "DECIDING_COURT"
+                    continue
+                if fl in ("falla:", "decide:", "resuelve:"):
+                    if current:
+                        units.append(current)
+                        current = None
+                    section = "DISPOSITIVE"
+                    continue
+            if court == "TC":
+                m = (re.match(r"^(\d{1,2}\.\d{1,2})\.\s+", line)
+                     if section == "DECIDING_COURT" else None)
+                if m is None and section == "DECIDING_COURT":
+                    m = re.match(r"^(\d{1,2})\.\s+(?=[A-ZÁÉÍÓÚÑ])", line)
             else:
-                m=re.match(r"^(\d{1,3})[).]\s+",line) if section=="DECIDING_COURT" else None
+                m = (re.match(r"^(\d{1,3})[).]\s+", line)
+                     if section == "DECIDING_COURT" else None)
             if m:
-                if current: units.append(current)
-                current={"foundation_number":m.group(1),"page":page["page"],
-                         "end_page":page["page"],"lines":[line],"section":section}
-            elif current and section==current["section"]:
-                current["lines"].append(line);current["end_page"]=page["page"]
-    if current: units.append(current)
-    for u in units:u["text"]=normalize_space(" ".join(u.pop("lines")))
+                if current:
+                    units.append(current)
+                current = {"foundation_number": m.group(1), "page": page["page"],
+                           "end_page": page["page"], "lines": [line],
+                           "section": section}
+            elif current and section == current["section"]:
+                current["lines"].append(line)
+                current["end_page"] = page["page"]
+    if current:
+        units.append(current)
+    for u in units:
+        u["text"] = normalize_space(" ".join(u.pop("lines")))
     return units
 
 
@@ -533,11 +573,12 @@ async def analyze_official_decision(req:AnalyzeDecisionRequest):
     doc=await fetch_document(str(req.url)); ex=extract_document_text(doc); court=detect_court(doc["host"],req.expected_court,ex["full_text"]); meta=extract_metadata_from_text(ex["full_text"],court)
     expected_match=decision_number_matches(ex["full_text"],court,req.expected_number)
     court_ok=court_matches(court,req.expected_court)
+    all_foundations = extract_numbered_foundations(ex["pages"], court)
     passages=find_relevant_passages(ex["pages"],req.legal_issue,req.max_passages,court)
     for passage in passages:
         passage.update(context_for_page(ex["pages"],passage["page"]))
     status="HOLDING_CANDIDATE" if ex["extraction_ok"] and court_ok and expected_match and passages else ("VERIFIED_SOURCE" if ex["extraction_ok"] and court_ok and expected_match else "NOT_VERIFIED")
-    return {"status":status,"official_source_verified":bool(ex["extraction_ok"] and court_ok and expected_match),"expected_court_match":court_ok,"expected_number_match":expected_match,"metadata":meta,"relevant_passages":passages,"jurisprudential_card":{"tribunal":court,"sala":meta.get("chamber"),"sentencia":meta.get("decision_number"),"fecha":meta.get("date"),"expediente":meta.get("case_number"),"estado_verificacion":status,"cuestion_juridica":req.legal_issue,"fundamentos_candidatos":passages,"ratio_decidendi":None,"regla_juridica":None,"review_required":True,"fuente_oficial":doc["final_url"],"paginas":ex["page_count"]},"source_url":doc["final_url"],"sha256":doc["sha256"]}
+    return {"status":status,"official_source_verified":bool(ex["extraction_ok"] and court_ok and expected_match),"expected_court_match":court_ok,"expected_number_match":expected_match,"metadata":meta,"relevant_passages":passages,"extraction_diagnostics":{"numbered_foundations_detected":len(all_foundations),"foundation_numbers_detected":[u["foundation_number"] for u in all_foundations[:100]],"candidate_passages_returned":len(passages),"selection_limit":req.max_passages,"note":"La ausencia de un fundamento en candidatos no prueba su inexistencia en el PDF."},"jurisprudential_card":{"tribunal":court,"sala":meta.get("chamber"),"sentencia":meta.get("decision_number"),"fecha":meta.get("date"),"expediente":meta.get("case_number"),"estado_verificacion":status,"cuestion_juridica":req.legal_issue,"fundamentos_candidatos":passages,"ratio_decidendi":None,"regla_juridica":None,"review_required":True,"fuente_oficial":doc["final_url"],"paginas":ex["page_count"]},"source_url":doc["final_url"],"sha256":doc["sha256"]}
 
 @app.post("/v1/promote-holding", operation_id="promoteVerifiedHolding")
 async def promote_verified_holding(req:HoldingPromotionRequest):
