@@ -479,9 +479,30 @@ def annotate_foundation_attribution(units: list[dict], court: str | None = None)
         # Explicit opening and closure of reproduced appellate reasoning.
         if re.search(r"(?:ordenanza|sentencia|fallo)\s+(?:impugnada|recurrida).{0,100}(?:transcriben|transcribe|textualmente)|(?:la alzada|la corte a qua).{0,110}(?:transcri|motiv[oó].{0,30}siguientes)",txt,re.I):
             quoted=True;u["attribution"]="LOWER_COURT_INTRODUCTION_REVIEW";u["attribution_indicators"]=["explicit_lower_court_quote_start"];continue
-        if quoted and re.search(r"^(?:\d+[).]\s+)?(?:seg[uú]n resulta del an[aá]lisis|de lo transcrito|de la transcripci[oó]n|del examen de la sentencia impugnada|del contenido de la sentencia impugnada|de la lectura de la sentencia impugnada)",txt[:250],re.I):
+        # An appellate quotation ends when the SCJ resumes its own numbered
+        # account of cassation submissions or analysis. In SCJ-PS-23-1546 the
+        # quotation is ground 2; ground 3 starts "El recurrente pretende".
+        # The previous implementation never saw that transition and marked
+        # grounds 3-31 as lower-court quotations.
+        quote_exit = re.search(
+            r"^(?:\d+[).]\s+)?(?:el recurrente pretende|la recurrente pretende|"
+            r"los recurrentes pretenden|la parte recurrente pretende|"
+            r"los recurridos pretenden|la parte recurrida pretende|"
+            r"en el desarrollo de su|seg[uú]n resulta del an[aá]lisis|"
+            r"de lo transcrito|de la transcripci[oó]n|"
+            r"del examen de la sentencia impugnada|"
+            r"del contenido de la sentencia impugnada|"
+            r"de la lectura de la sentencia impugnada)",
+            txt[:300], re.I)
+        if quoted and quote_exit:
             quoted=False
-            u["attribution"]="DECIDING_COURT_NARRATIVE_REVIEW";u["attribution_indicators"]=["explicit_quote_scope_exit"];continue
+            attr, indicators=attribution_context(txt)
+            if attr=="UNDETERMINED_REQUIRES_CONTEXT":
+                attr="DECIDING_COURT_NARRATIVE_REVIEW"
+                indicators=["explicit_quote_scope_exit", "requires_individual_review"]
+            else:
+                indicators=["explicit_quote_scope_exit"]+indicators
+            u["attribution"]=attr;u["attribution_indicators"]=indicators;continue
         if quoted:
             u["attribution"]="LOWER_COURT_QUOTATION_REVIEW";u["attribution_indicators"]=["within_lower_court_quotation_scope"];continue
         attr, indicators=attribution_context(txt)
