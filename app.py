@@ -68,7 +68,7 @@ def allowed_host(host: str | None) -> bool:
 
 def tokenize(v: str | None) -> set[str]:
     stop = {"de","la","el","los","las","un","una","y","o","a","en","por","para","con","del","que","se","su","sus","al","como","es","son","ha","han","ser","fue","esta","este","sobre","entre","cuando","sin","si","no","lo","le","les","más","mas"}
-    return {t for t in re.findall(r"[a-záéíóúñü0-9]{3,}", (v or "").lower()) if t not in stop}
+    return {t for t in re.findall(r"[a-z0-9]{3,}", fold(v)) if t not in {fold(w) for w in stop}}
 
 def overlap_ratio(a: str, b: str) -> float:
     ta, tb = tokenize(a), tokenize(b)
@@ -330,7 +330,7 @@ async def fetch_document(url: str):
     current = url
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(35, connect=10), follow_redirects=False,
-                                     headers={"User-Agent": "ELCOHE-JURIS-RD/1.5.7"}, trust_env=False) as client:
+                                     headers={"User-Agent": "ELCOHE-JURIS-RD/1.5.9"}, trust_env=False) as client:
             for hop in range(MAX_REDIRECTS + 1):
                 validate_official_url(current)
                 async with client.stream("GET", current) as response:
@@ -492,37 +492,53 @@ def annotate_foundation_attribution(units: list[dict], court: str | None = None)
 
 
 def find_relevant_passages(pages, issue, limit, court=None):
+    """Rank numbered grounds without silently discarding low-scoring grounds.
+
+    Scores are *priorities for human review*, not findings of authorship or
+    verified holdings. In particular, quoted lower-court reasoning is labeled
+    and deprioritized, never represented as the deciding court's ratio.
+    """
     units = annotate_foundation_attribution(extract_numbered_foundations(pages, court), court)
     candidates = []
     for i, unit in enumerate(units):
         attr = unit["attribution"]
         score = score_passage(unit["text"], issue, attr)
-        if attr in ("DECIDING_COURT_SECTION_REVIEW", "DECIDING_COURT_NARRATIVE_REVIEW"):
+        if attr in ("DECIDING_COURT_SECTION_REVIEW", "DECIDING_COURT_NARRATIVE_REVIEW",
+                    "POSSIBLE_JUDICIAL_REASONING_REVIEW"):
             score += 0.8
         if attr.startswith("LOWER_COURT_"):
             score -= 2.5
-        if score <= 0: continue
+        # A zero/negative score means LOW PRIORITY, not "not a foundation".
+        # Previously this filter removed 30 of 31 detected grounds.
         preceding = units[i-1]["text"] if i else ""
         following = units[i+1]["text"] if i+1 < len(units) else ""
         candidates.append({
-            "page":unit["page"], "end_page":unit["end_page"],
-            "foundation_number":unit["foundation_number"],
-            "score":round(score,3), "text":unit["text"][:1800],
-            "text_truncated":len(unit["text"])>1800,
-            "attribution":attr, "attribution_indicators":unit["attribution_indicators"],
-            "preceding_context":preceding[-500:] or None,
-            "following_context":following[:500] or None,
-            "attribution_is_determinative":False,
-            "ratio_decidendi_verified":False,
-            "review_required":True,
+            "page": unit["page"], "end_page": unit["end_page"],
+            "foundation_number": unit["foundation_number"],
+            "score": round(score, 3), "text": unit["text"][:1800],
+            "text_truncated": len(unit["text"]) > 1800,
+            "attribution": attr,
+            "attribution_indicators": unit["attribution_indicators"],
+            "preceding_context": preceding[-500:] or None,
+            "following_context": following[:500] or None,
+            "attribution_is_determinative": False,
+            "ratio_decidendi_verified": False,
+            "review_required": True,
         })
-    candidates.sort(key=lambda x:(-x["score"],x["page"]))
-    out=[]; seen=set()
+    # Favor passages mentioning the issue and judicial reasoning. A later
+    # numbered ground can be more useful than the first factual background.
+    candidates.sort(key=lambda x: (-x["score"], x["page"],
+                                   int(x["foundation_number"].split(".")[0])))
+    out = []
+    seen = set()
     for c in candidates:
-        key=(c["foundation_number"], c["page"])
-        if key in seen:continue
-        seen.add(key);out.append(c)
-        if len(out)>=limit:break
+        key = (c["foundation_number"], c["page"])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(c)
+        if len(out) >= limit:
+            break
     return out
 
 def normalized_contains(haystack, needle): return fold(needle) in fold(haystack)
