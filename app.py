@@ -1,16 +1,18 @@
+
 from __future__ import annotations
-
-import hashlib
-import os
-import re
-from urllib.parse import quote_plus, urlparse
-
+import hashlib, io, re, unicodedata, ipaddress, socket
+from typing import Any
+from urllib.parse import urlparse, urljoin
 import httpx
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel, HttpUrl, Field
+from pypdf import PdfReader
 
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.9"
+MAX_DOCUMENT_BYTES = 12 * 1024 * 1024
+MAX_PDF_PAGES = 350
+MAX_REDIRECTS = 3
 TC_SEARCH_URL = "https://www.tribunalconstitucional.gob.do/consultas/secretar%C3%ADa/sentencias/"
 SCJ_PORTAL_URL = "https://consultasentenciascj.poderjudicial.gob.do/"
 ALLOWED_HOST_SUFFIXES = (
@@ -20,204 +22,663 @@ ALLOWED_HOST_SUFFIXES = (
     "tribunalsitestorage.blob.core.windows.net",
 )
 
-app = FastAPI(title="ELCOHE-JURIS RD Jurisprudence Actions", version=APP_VERSION)
-
+app = FastAPI(
+    title="ELCOHE-JURIS RD Jurisprudence Actions",
+    version=APP_VERSION,
+    description="Verificación, lectura y análisis jurisprudencial dominicano."
+)
 
 class VerifyRequest(BaseModel):
     url: HttpUrl
     expected_court: str | None = None
     expected_number: str | None = None
 
+class AnalyzeDecisionRequest(BaseModel):
+    url: HttpUrl
+    expected_court: str | None = None
+    expected_number: str | None = None
+    legal_issue: str | None = None
+    max_passages: int = Field(default=6, ge=1, le=12)
+
+class HoldingPromotionRequest(BaseModel):
+    url: HttpUrl
+    expected_court: str
+    expected_number: str | None = None
+    legal_issue: str
+    legal_proposition: str = Field(min_length=20, max_length=2000)
+    support_quote: str = Field(min_length=40, max_length=1800)
+    support_page: int = Field(ge=1)
+    outcome_quote: str | None = Field(default=None, max_length=1800)
+    outcome_page: int | None = Field(default=None, ge=1)
+    judicial_reasoning_reviewed: bool = False
+    reviewer_name: str | None = Field(default=None, min_length=3, max_length=120)
+    reviewer_confirmation: str | None = Field(default=None, max_length=120)
+
+def normalize_space(v: str | None) -> str:
+    return re.sub(r"\s+", " ", v or "").strip()
+
+def fold(v: str | None) -> str:
+    v = normalize_space(v).lower()
+    return "".join(ch for ch in unicodedata.normalize("NFD", v) if unicodedata.category(ch) != "Mn")
 
 def allowed_host(host: str | None) -> bool:
-    if not host:
-        return False
+    if not host: return False
     host = host.lower().strip(".")
-    return any(host == suffix or host.endswith("." + suffix) for suffix in ALLOWED_HOST_SUFFIXES)
+    return any(host == s or host.endswith("." + s) for s in ALLOWED_HOST_SUFFIXES)
+
+def tokenize(v: str | None) -> set[str]:
+    stop = {"de","la","el","los","las","un","una","y","o","a","en","por","para","con","del","que","se","su","sus","al","como","es","son","ha","han","ser","fue","esta","este","sobre","entre","cuando","sin","si","no","lo","le","les","más","mas"}
+    return {t for t in re.findall(r"[a-z0-9]{3,}", fold(v)) if t not in {fold(w) for w in stop}}
+
+def overlap_ratio(a: str, b: str) -> float:
+    ta, tb = tokenize(a), tokenize(b)
+    return len(ta & tb) / max(len(ta), 1) if ta else 0.0
+
+def detect_court(host: str | None, expected: str | None = None, text: str | None = None):
+    """Use decision-header evidence; referenced courts in background do not govern."""
+    opening = (text or "")[:2200]
+    tc_number = re.search(r"\b(?:SENTENCIA\s+)?TC/\d{3,4}/\d{2}\b", opening, re.I)
+    scj_number = re.search(r"\bSCJ-[A-Z]{2}-\d{2}-\d{3,5}\b", opening, re.I)
+    if tc_number and not scj_number: return "TC"
+    if scj_number and not tc_number: return "SCJ"
+    if tc_number and scj_number: return None
+    top = fold(opening[:500])
+    if "tribunal constitucional" in top and "suprema corte de justicia" not in top: return "TC"
+    if "suprema corte de justicia" in top and "tribunal constitucional" not in top: return "SCJ"
+    return None
 
 
-def normalize_space(value: str | None) -> str | None:
-    if value is None:
-        return None
-    return re.sub(r"\s+", " ", value).strip()
+def primary_decision_number(text: str, court: str | None):
+    """Find the decision number in the opening; do not search cited precedents."""
+    opening = (text or "")[:4500]
+    pattern = (r"\bSCJ-[A-Z]{2}-\d{2}-\d{3,5}\b" if court == "SCJ"
+               else r"\bTC/\d{3,4}/\d{2}\b" if court == "TC" else None)
+    if not pattern: return None
+    match = re.search(pattern, opening, re.I)
+    return match.group(0).upper() if match else None
 
 
-def tc_candidate_links(html: str, limit: int) -> list[dict]:
-    soup = BeautifulSoup(html, "html.parser")
-    results: list[dict] = []
-    seen: set[str] = set()
-    pattern = re.compile(r"TC/\d{3,4}/\d{2}", re.I)
-    for a in soup.find_all("a", href=True):
-        text = normalize_space(a.get_text(" ", strip=True)) or ""
-        match = pattern.search(text)
-        if not match:
+def decision_number_matches(text: str, court: str | None, expected: str | None):
+    identified = primary_decision_number(text, court)
+    if not expected: return identified is not None
+    return identified is not None and fold(identified) == fold(expected)
+
+def court_matches(detected: str | None, expected: str | None) -> bool:
+    if not expected:
+        return detected in ("SCJ", "TC")
+    return detected == expected.strip().upper()
+
+def clean_page_text(text: str) -> str:
+    """Remove identifiable SCJ running furniture, including mid-sentence insertions.
+
+    Keep substantive text and paragraph boundaries; never silently repair words.
+    """
+    text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    # SCJ footer can be injected in the middle of a judicial paragraph by pypdf.
+    # Match the complete identifying footer rather than deleting arbitrary lines.
+    text = re.sub(
+        r"SCJ-[A-Z]{2}-\d{2}-\d{3,5}\s+Nacional,\s*Rep\.?\s*Dom\.?\s*"
+        r"Tel\.?\s*:\s*\(?\d{3}\)?\s*\d{3}[-–]\d{4}\s*[•·]?\s*"
+        r"Direcci[oó]n\s+de\s+Internet\s*:\s*https?\s*:\s*//\s*"
+        r"(?:www\.)?poderjudicial\.gob\.do\s*PR\s*/\s*p[aá]g\.?\s*\d+",
+        " ", text, flags=re.I,
+    )
+    # Other full footer variants (where the decision number is not repeated).
+    text = re.sub(
+        r"(?:Av\.?\s*Enrique\s+Jim[eé]nez\s+Moya[^\n]{0,140})?"
+        r"Nacional,\s*Rep\.?\s*Dom\.?\s*Tel\.?\s*:\s*"
+        r"\(?\d{3}\)?\s*\d{3}[-–]\d{4}\s*[•·]?\s*"
+        r"Direcci[oó]n\s+de\s+Internet\s*:\s*https?\s*:\s*//\s*"
+        r"(?:www\.)?poderjudicial\.gob\.do\s*PR\s*/\s*p[aá]g\.?\s*\d+",
+        " ", text, flags=re.I,
+    )
+    text = re.sub(r"(?im)^\s*(?:REP[ÚU]BLICA DOMINICANA|SUPREMA CORTE DE JUSTICIA)\s*$", "", text)
+    text = re.sub(r"(?im)^\s*(?:Av\.?\s*Enrique Jim[eé]nez Moya|Direcci[oó]n de Internet:|Tel\.:|PR/p[aá]g\.)[^\n]*$", "", text)
+    return re.sub(r"[ \t]+", " ", text).strip()
+
+def context_for_page(pages: list[dict], page_number: int, window: int = 1) -> dict:
+    """Return neighboring pages as context; not proof of authorship."""
+    return {"page": page_number, "context_pages": [p["page"] for p in pages if abs(p["page"] - page_number) <= window]}
+
+MONTHS = ("enero", "febrero", "marzo", "abril", "mayo", "junio", "julio",
+          "agosto", "septiembre", "octubre", "noviembre", "diciembre")
+SPANISH_NUMBERS = {"uno":1,"dos":2,"tres":3,"cuatro":4,"cinco":5,"seis":6,"siete":7,
+    "ocho":8,"nueve":9,"diez":10,"once":11,"doce":12,"trece":13,"catorce":14,
+    "quince":15,"dieciseis":16,"dieciséis":16,"diecisiete":17,"dieciocho":18,
+    "diecinueve":19,"veinte":20,"veintiuno":21,"veintidos":22,"veintidós":22,
+    "veintitres":23,"veintitrés":23,"veinticuatro":24,"veinticinco":25,
+    "veintiseis":26,"veintiséis":26,"veintisiete":27,"veintiocho":28,
+    "veintinueve":29,"treinta":30,"treinta y uno":31}
+
+def extract_metadata_from_text(text: str, court: str | None) -> dict[str, Any]:
+    """Extract identifying fields from the opening, never from cited judgments."""
+    opening = (text or "")[:6500]
+    meta = {"decision_number": primary_decision_number(text, court), "date": None,
+            "case_number": None, "chamber": None}
+    if court == "TC":
+        m = re.search(r"\bTC-\d{2}-\d{4}-\d{4}\b", opening, re.I)
+        if m: meta["case_number"] = m.group(0).upper()
+        meta["chamber"] = "Tribunal Constitucional"
+        # Date is the issuance formula, not a date in the procedural history.
+        m = re.search(r"\ba los\s+([a-záéíóúñ ]+?)\s*\(\s*(\d{1,2})\s*\)\s*d[ií]as?\s+del\s+mes\s+de\s+(" + "|".join(MONTHS) + r")\s+del\s+a[nñ]o\s+dos\s+mil\s+[a-záéíóúñ ]+?\(\s*(20\d{2})\s*\)", opening, re.I)
+        if m: meta["date"] = f"{int(m.group(2))} de {m.group(3).lower()} de {m.group(4)}"
+        if not meta["date"]:
+            m = re.search(r"\ba los\s+([a-záéíóúñ ]+?)\s*\(\s*(\d{1,2})\s*\)\s*d[ií]as?\s+del\s+mes\s+de\s+(" + "|".join(MONTHS) + r")\s+del\s+a[nñ]o", opening, re.I)
+            if m:
+                y = re.search(r"\b(20\d{2})\b", opening[m.end():m.end()+110])
+                if y: meta["date"] = f"{int(m.group(2))} de {m.group(3).lower()} de {y.group(1)}"
+    elif court == "SCJ":
+        m = re.search(r"\b\(?(20\d{2}-R\d{5,})\)?", opening, re.I)
+        if m: meta["case_number"] = m.group(1)
+        if not meta["case_number"]:
+            m = re.search(r"\b(?:expediente|exp\.)\s*(?:n[úu]m\.?|no\.?)\s*[:#-]?\s*([A-Za-z0-9][A-Za-z0-9./-]{5,})", opening, re.I)
+            if m: meta["case_number"] = m.group(1)
+        m = re.search(r"\b(PRIMERA|SEGUNDA|TERCERA)\s+SALA\s+DE\s+LA\s+SUPREMA", opening, re.I)
+        if m: meta["chamber"] = m.group(1).capitalize() + " Sala"
+        m = re.search(r"\ben fecha\s+(\d{1,2})\s+de\s+(" + "|".join(MONTHS) + r")\s+de\s+(20\d{2})", opening, re.I)
+        if m: meta["date"] = f"{int(m.group(1))} de {m.group(2).lower()} de {m.group(3)}"
+    return meta
+
+# Attribution is deliberately conservative: a keyword alone is not judicial authorship.
+REVIEWED_COURT_INTRO = re.compile(
+    r"(?:esta sala|este tribunal|esta suprema corte|este tribunal constitucional)\s+"
+    r"(?:considera|advierte|estima|observa|comprueba|entiende|juzga|verifica|retiene|establece)", re.I)
+LOWER_COURT_INTRO = re.compile(
+    r"(?:la corte a qua|la corte de apelaci[oó]n|el tribunal a quo|la jurisdicci[oó]n de fondo|"
+    r"la sentencia impugnada|la corte recurrida|la alzada)", re.I)
+PARTY_INTRO = re.compile(
+    r"(?:la parte recurrente|la parte recurrida|el recurrente|la recurrente|"
+    r"la demandante|la demandada|la apelante|el apelante)\s+"
+    r"(?:alega|sostiene|afirma|argumenta|aduce|expone|invoca|señala)", re.I)
+QUOTED_LOWER_COURT = re.compile(
+    r"(?:finalmente\s+concluye\s+la\s+corte\s+motivando\s+lo\s+siguiente)|"
+    r"(?:la corte|el tribunal|la alzada)\s+(?:motiv[oó]|expres[oó]|estableci[oó]|"
+    r"concluy[oó]|consider[oó])\s+(?:lo siguiente|que)|"
+    r"(?:la sentencia|el fallo)\s+(?:impugnada|recurrida)\s+(?:establece|expresa|señala)", re.I)
+DISPOSITIVE_INTRO = re.compile(r"^\s*(?:FALLA|DECIDE|RESUELVE)\s*:?\s*$", re.I)
+NUMBERED_START = re.compile(r"(?m)^\s*\d{1,3}[).]\s+")
+
+def strip_running_furniture(text: str) -> str:
+    # Apply the same cleanup to analysis and promotion; preserve line breaks.
+    text = clean_page_text(text)
+    kept = []
+    for line in text.splitlines():
+        t = normalize_space(line)
+        if re.match(r"^(?:Exp\. n[uú]m\.|Partes:|Materia:|Decisi[oó]n:|Ponente:|WT/|P[aá]g\.\s*\d+)", t, re.I):
             continue
-        number = match.group(0).upper()
-        href = a["href"]
-        if href.startswith("/"):
-            href = "https://www.tribunalconstitucional.gob.do" + href
-        if href in seen:
-            continue
-        seen.add(href)
-        parent_text = normalize_space(a.parent.get_text(" ", strip=True) if a.parent else text)
-        date_match = re.search(r"\b\d{2}-\d{2}-\d{4}\b", parent_text or "")
-        ref_match = re.search(r"TC-\d{2}-\d{4}-\d{4}", parent_text or "", re.I)
-        results.append({
-            "court": "TC",
-            "decision_number": number,
-            "date": date_match.group(0) if date_match else None,
-            "reference": ref_match.group(0).upper() if ref_match else None,
-            "relative_to": parent_text,
-            "source_url": href,
-            "status": "LOCATED",
-            "note": "Localizada en el portal oficial del Tribunal Constitucional; abra/verifique el documento antes de atribuir ratio decidendi.",
-        })
-        if len(results) >= limit:
-            break
-    return results
+        kept.append(line)
+    return "\n".join(kept)
+
+def split_units(text: str):
+    """Conservative segmentation. Never alter numbered markers or discard short units."""
+    text = strip_running_furniture(text.replace("\r\n", "\n").replace("\r", "\n"))
+    # An inline numbered boundary must follow terminal punctuation; do not
+    # mistake article numbers, dates, or citations for paragraph markers.
+    text = re.sub(r"(?<=[.!?;:])([ \t]+)(?=\d{1,3}[).][ \t]+[A-ZÁÉÍÓÚÑ])", "\n", text)
+    parts = re.split(r"\n[ \t]*\n+|\n(?=[ \t]*\d{1,3}[).][ \t]+)", text)
+    return [normalize_space(part) for part in parts if normalize_space(part)]
 
 
-@app.get("/health")
-def health():
-    return {"ok": True, "service": "ELCOHE-JURIS RD Jurisprudence Actions", "version": APP_VERSION}
+
+def locate_support_context(pages: list[dict], support_page: int, support_quote: str) -> dict:
+    """Anchor the quote on its declared page; read adjacent pages for context only.
+
+    A quote on another page must never satisfy the declared-page check.
+    Page furniture is removed by split_units; context is not proof of authorship.
+    """
+    empty = {"located": False, "unit": "", "preceding": "", "following": "",
+             "preceding_page": None, "following_page": None}
+    if not (1 <= support_page <= len(pages)):
+        return empty
+
+    current = split_units(pages[support_page - 1]["text"])
+    index = next((i for i, unit in enumerate(current)
+                  if normalized_contains(unit, support_quote)), None)
+    if index is None:
+        return empty
+
+    preceding = current[index - 1] if index > 0 else ""
+    following = current[index + 1] if index + 1 < len(current) else ""
+    preceding_page = support_page if preceding else None
+    following_page = support_page if following else None
+
+    if not preceding and support_page > 1:
+        previous = split_units(pages[support_page - 2]["text"])
+        if previous:
+            preceding, preceding_page = previous[-1], support_page - 1
+    if not following and support_page < len(pages):
+        next_units = split_units(pages[support_page]["text"])
+        if next_units:
+            following, following_page = next_units[0], support_page + 1
+
+    return {"located": True, "unit": current[index], "preceding": preceding,
+            "following": following, "preceding_page": preceding_page,
+            "following_page": following_page}
 
 
-@app.get("/v1/tc/search")
-async def search_tc(
-    q: str = Query(min_length=2, max_length=240),
-    year: int | None = Query(default=None, ge=2012, le=2100),
-    limit: int = Query(default=10, ge=1, le=20),
-):
-    params = {
-        "searchString": q,
-        "searchCriteria": "",
-        "size": max(limit, 10),
-    }
-    if year:
-        # El portal usa filtros internos que pueden cambiar; mantener el año como criterio textual
-        # evita afirmar una semántica de parámetro no documentada.
-        params["searchString"] = f'{q} {year}'
-    try:
-        async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers={"User-Agent": "ELCOHE-JURIS-RD/1.4"}) as client:
-            resp = await client.get(TC_SEARCH_URL, params=params)
-            resp.raise_for_status()
-    except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail=f"No fue posible consultar el portal oficial del TC: {exc}")
-    results = tc_candidate_links(resp.text, limit)
-    return {
-        "query": q,
-        "source": str(resp.url),
-        "results": results,
-        "warning": "Los resultados son candidatos localizados en fuente oficial. Verifique el PDF/documento antes de citar una regla jurídica.",
-    }
+def attribution_context(passage: str, preceding: str = "", following: str = "") -> tuple[str, list[str]]:
+    """Clasificación conservadora; contexto no sustituye revisión jurídica humana."""
+    p = normalize_space(passage)
+    prior = normalize_space(preceding)
+    nxt = normalize_space(following)
+    indicators = []
+    # Prioridad de exclusiones: nunca promocionar argumentos o citas ajenas.
+    quote_intro = QUOTED_LOWER_COURT.search(p) or QUOTED_LOWER_COURT.search(prior[-650:])
+    if quote_intro:
+        return "LOWER_COURT_QUOTATION_REVIEW", ["lower_court_quotation_or_intro"]
+    if PARTY_INTRO.search(p) or re.search(r"(?:en su memorial de casaci[oó]n|la parte recurrente sostiene)", prior[-450:], re.I):
+        return "PARTY_ARGUMENT_OR_MIXED_REVIEW", ["party_argument_or_mixed"]
+    if re.search(r"\b(?:la doctrina ha expresado|seg[uú]n la doctrina)\b", p, re.I):
+        return "DOCTRINAL_QUOTATION_REVIEW", ["doctrine_citation"]
+    if DISPOSITIVE_INTRO.match(p) or re.match(r"^(?:PRIMERO|SEGUNDO|TERCERO)\s*:", p, re.I):
+        return "DISPOSITIVE_REVIEW", ["dispositive"]
+    # Marcador judicial positivo explícito: candidato, no prueba concluyente.
+    if REVIEWED_COURT_INTRO.search(p):
+        indicators.append("explicit_deciding_court_reference")
+    if re.search(r"\b(?:esta sala|esta suprema corte|este tribunal|esta corte de casaci[oó]n)\b", p, re.I):
+        indicators.append("court_self_reference")
+    # La continuidad argumentativa es solo señal de revisión, nunca prueba
+    # suficiente para atribución judicial positiva.
+    if re.search(r"\b(?:en primer orden|esto se debe a que|en ese sentido|por consiguiente|en consecuencia)\b", p, re.I):
+        indicators.append("argumentative_continuity")
+    if re.search(r"\b(?:esta decisi[oó]n|consideraciones que se exponen en lo adelante)\b", prior[-650:], re.I):
+        indicators.append("preceding_judicial_context_candidate")
+    if re.search(r"\b(?:en consecuencia|por tanto|as[ií] las cosas)\b", nxt[:400], re.I):
+        indicators.append("following_argumentative_context")
+    if "explicit_deciding_court_reference" in indicators or "court_self_reference" in indicators:
+        return "POSSIBLE_JUDICIAL_REASONING_REVIEW", indicators
+    # Caso de continuidad: requiere dos señales independientes; siempre es
+    # una hipótesis sujeta a revisión, no una atribución certificada.
+    if "argumentative_continuity" in indicators and "preceding_judicial_context_candidate" in indicators:
+        return "POSSIBLE_JUDICIAL_REASONING_REVIEW", indicators
+    return "UNDETERMINED_REQUIRES_CONTEXT", indicators
 
+def classify_passage(passage: str, context: str = "") -> tuple[str, list[str]]:
+    return attribution_context(passage, context)
 
-@app.get("/v1/scj/search-plan")
-def prepare_scj_search(
-    q: str = Query(min_length=2, max_length=240),
-    chamber: str | None = Query(default=None, max_length=80),
-    matter: str | None = Query(default=None, max_length=80),
-    year_from: int | None = Query(default=None, ge=1908, le=2100),
-    year_to: int | None = Query(default=None, ge=1908, le=2100),
-):
-    if year_from and year_to and year_from > year_to:
-        raise HTTPException(status_code=400, detail="year_from no puede ser mayor que year_to")
-    filters = {"sala": chamber, "materia": matter, "desde": year_from, "hasta": year_to}
-    filters = {k: v for k, v in filters.items() if v is not None}
-    site_q = f'site:poderjudicial.gob.do "{q}"'
-    if chamber:
-        site_q += f' "{chamber}"'
-    if matter:
-        site_q += f' "{matter}"'
-    queries = [site_q, f'site:poderjudicial.gob.do/wp-content/uploads "{q}" sentencia']
-    return {
-        "query": q,
-        "official_portal": SCJ_PORTAL_URL,
-        "filters": filters,
-        "search_steps": [
-            "Abrir el buscador oficial de la SCJ.",
-            "Aplicar Sala, Materia y rango temporal cuando estén disponibles.",
-            "Buscar primero por número de sentencia/expediente si existe; de lo contrario, usar términos jurídicos específicos.",
-            "Localizar candidatos en dominio oficial poderjudicial.gob.do.",
-            "Abrir la decisión y ejecutar verifyOfficialDocument antes de citar el criterio.",
-        ],
-        "web_queries": queries,
-        "status": "SEARCH_PLAN_ONLY",
-        "warning": "La interfaz oficial de consulta SCJ es dinámica. Este endpoint no declara decisiones verificadas ni simula resultados inexistentes.",
-    }
+def score_passage(passage: str, issue: str | None, attribution: str | None = None):
+    attribution = attribution or classify_passage(passage)[0]
+    it, pt = tokenize(issue), tokenize(passage)
+    score = 5.0 * len(it & pt) / len(it) if it else 0.0
+    score += {
+        "POSSIBLE_JUDICIAL_REASONING_REVIEW": 2.0,
+        "LOWER_COURT_QUOTATION_REVIEW": -2.0,
+        "PARTY_ARGUMENT_OR_MIXED_REVIEW": -2.0,
+        "DOCTRINAL_QUOTATION_REVIEW": -1.5,
+        "DISPOSITIVE_REVIEW": 0.0,
+        "UNDETERMINED_REQUIRES_CONTEXT": -1.5,
+    }.get(attribution, 0.0)
+    if len(passage) < 120: score -= 0.5
+    return score
 
-
-@app.post("/v1/verify")
-async def verify_document(body: VerifyRequest):
-    url = str(body.url)
+def validate_official_url(url: str):
     parsed = urlparse(url)
-    if parsed.scheme != "https" or not allowed_host(parsed.hostname):
-        raise HTTPException(status_code=400, detail="La URL debe ser HTTPS y pertenecer a un dominio oficial permitido.")
+    if parsed.scheme != "https" or not allowed_host(parsed.hostname) or parsed.username or parsed.password or parsed.port not in (None, 443):
+        raise HTTPException(400, "Se requiere HTTPS, puerto estándar y dominio oficial permitido.")
+    # Defense in depth: reject local/private/reserved address resolutions.
     try:
-        async with httpx.AsyncClient(timeout=25, follow_redirects=True, headers={"User-Agent": "ELCOHE-JURIS-RD/1.4"}) as client:
-            resp = await client.get(url)
-    except httpx.HTTPError as exc:
-        return {
-            "status": "NOT_VERIFIED", "official_domain": True, "court": body.expected_court,
-            "url": url, "final_url": None, "http_status": None, "content_type": None,
-            "title": None, "detected_number": None, "expected_number_match": None,
-            "sha256": None, "note": f"El dominio es oficial, pero no fue posible obtener el documento: {exc}",
-        }
+        addresses = socket.getaddrinfo(parsed.hostname, 443, type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        raise HTTPException(502, "No se pudo resolver el dominio oficial.")
+    for result in addresses:
+        address = ipaddress.ip_address(result[4][0])
+        if not address.is_global:
+            raise HTTPException(400, "La dirección de red no es pública.")
 
-    final_url = str(resp.url)
-    final_host = urlparse(final_url).hostname
-    if not allowed_host(final_host):
-        return {
-            "status": "REJECTED", "official_domain": False, "court": body.expected_court,
-            "url": url, "final_url": final_url, "http_status": resp.status_code,
-            "content_type": resp.headers.get("content-type"), "title": None,
-            "detected_number": None, "expected_number_match": None, "sha256": None,
-            "note": "La redirección terminó fuera de los dominios oficiales permitidos.",
-        }
 
-    data = resp.content
-    content_type = (resp.headers.get("content-type") or "").split(";")[0].lower()
-    title = None
-    text_sample = ""
-    if "html" in content_type:
-        soup = BeautifulSoup(resp.text, "html.parser")
-        title = normalize_space(soup.title.get_text(" ", strip=True) if soup.title else None)
-        text_sample = normalize_space(soup.get_text(" ", strip=True)) or ""
-    number_pattern = re.compile(r"(?:TC/\d{3,4}/\d{2}|SCJ-[A-Z]{2}-\d{2}-\d{3,5}|\bSentencia\s+(?:núm\.?|No\.?)\s*[A-Za-z0-9-]+)", re.I)
-    detected = None
-    if text_sample:
-        m = number_pattern.search(text_sample[:250000])
-        detected = normalize_space(m.group(0)) if m else None
-    expected_match = None
-    if body.expected_number:
-        haystack = (detected or "") + " " + text_sample[:250000]
-        expected_match = body.expected_number.lower().replace(" ", "") in haystack.lower().replace(" ", "")
+async def fetch_document(url: str):
+    current = url
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(35, connect=10), follow_redirects=False,
+                                     headers={"User-Agent": "ELCOHE-JURIS-RD/1.5.9"}, trust_env=False) as client:
+            for hop in range(MAX_REDIRECTS + 1):
+                validate_official_url(current)
+                async with client.stream("GET", current) as response:
+                    if response.status_code in (301, 302, 303, 307, 308):
+                        if hop == MAX_REDIRECTS: raise HTTPException(502, "Demasiadas redirecciones.")
+                        location = response.headers.get("location")
+                        if not location: raise HTTPException(502, "Redirección sin destino.")
+                        current = urljoin(current, location)
+                        continue
+                    response.raise_for_status()
+                    claimed = response.headers.get("content-length")
+                    if claimed and claimed.isdigit() and int(claimed) > MAX_DOCUMENT_BYTES:
+                        raise HTTPException(413, "El documento supera el límite de 12 MB.")
+                    chunks = []; size = 0
+                    async for chunk in response.aiter_bytes():
+                        size += len(chunk)
+                        if size > MAX_DOCUMENT_BYTES:
+                            raise HTTPException(413, "El documento supera el límite de 12 MB.")
+                        chunks.append(chunk)
+                    data = b"".join(chunks)
+                    ct = (response.headers.get("content-type") or "").split(";")[0].lower()
+                    return {"final_url": current, "host": urlparse(current).hostname,
+                            "content_type": ct, "data": data,
+                            "text_response": data.decode(response.encoding or "utf-8", errors="replace") if "html" in ct else None,
+                            "http_status": response.status_code,
+                            "sha256": hashlib.sha256(data).hexdigest()}
+    except HTTPException:
+        raise
+    except (httpx.HTTPError, ValueError, OSError) as exc:
+        raise HTTPException(502, f"No fue posible obtener el documento oficial: {type(exc).__name__}")
+    raise HTTPException(502, "No se obtuvo el documento.")
 
-    ok_status = 200 <= resp.status_code < 300
-    status = "VERIFIED_SOURCE" if ok_status and ("pdf" in content_type or "html" in content_type) else "LOCATED_OFFICIAL"
-    note = "Fuente oficial obtenida. La verificación de fuente no equivale por sí sola a haber identificado la ratio decidendi."
-    if expected_match is False:
-        status = "NOT_VERIFIED"
-        note = "La fuente es oficial, pero no se encontró el número esperado en el contenido accesible. Revise manualmente el documento."
+def extract_document_text(doc):
+    ct, data = doc["content_type"], doc["data"]
+    if "pdf" in ct or data[:4] == b"%PDF":
+        try:
+            reader = PdfReader(io.BytesIO(data), strict=False)
+            if reader.is_encrypted: raise HTTPException(422, "PDF cifrado: requiere revisión manual.")
+            if len(reader.pages) > MAX_PDF_PAGES: raise HTTPException(413, "PDF demasiado extenso.")
+        except HTTPException: raise
+        except Exception: raise HTTPException(422, "PDF inválido o ilegible.")
+        pages=[]
+        for i,p in enumerate(reader.pages,1):
+            try: txt = (p.extract_text() or "").replace("\r\n", "\n")
+            except Exception: txt = ""
+            pages.append({"page":i,"text":txt})
+        full = "\n\n".join(p["text"] for p in pages if p["text"])
+        return {"document_type":"PDF","pages":pages,"full_text":full,"page_count":len(pages),"extraction_ok":len(full.strip()) >= 100}
+    if "html" in ct:
+        soup = BeautifulSoup(doc["text_response"] or "", "html.parser")
+        for tag in soup(["script", "style", "nav", "footer"]): tag.decompose()
+        text = normalize_space(soup.get_text("\n", strip=True))
+        return {"document_type":"HTML","pages":[{"page":1,"text":text}],"full_text":text,"page_count":1,"extraction_ok":bool(text.strip())}
+    raise HTTPException(415, f"Tipo no compatible: {ct or 'desconocido'}")
 
-    court = body.expected_court
-    if not court:
-        if "tribunalconstitucional" in (final_host or "") or "tribunalsitestorage" in (final_host or ""):
-            court = "TC"
-        elif "poderjudicial" in (final_host or ""):
-            court = "SCJ"
+def extract_numbered_foundations(pages: list[dict], court: str | None = None) -> list[dict]:
+    """Recover numbered reasons across pages, including PDF inline boundaries.
 
-    return {
-        "status": status,
-        "official_domain": True,
-        "court": court,
-        "url": url,
-        "final_url": final_url,
-        "http_status": resp.status_code,
-        "content_type": content_type or None,
-        "title": title,
-        "detected_number": detected,
-        "expected_number_match": expected_match,
-        "sha256": hashlib.sha256(data).hexdigest() if data else None,
-        "note": note,
-    }
+    This is an extraction aid, NOT proof of judicial authorship. Never
+    attribute holdings without subsequent human review of the original PDF.
+    """
+    units = []
+    current = None
+    section = "UNDETERMINED"
+    for page in pages:
+        cleaned = strip_running_furniture(page["text"])
+        cleaned = re.sub(r"(?im)^\s*Expediente n[úu]m\..*?(?=\n|$)", "", cleaned)
+        # pypdf sometimes joins numbered paragraphs on the same line.
+        # Only split after punctuation and an uppercase initial; avoid article
+        # numbers, decimal quantities, and citations inside sentences.
+        cleaned = re.sub(
+            r"(?<=[.!?;:])([ \t]+)(?=\d{1,3}[).][ \t]+[A-ZÁÉÍÓÚÑ])",
+            "\n", cleaned,
+        )
+        for line in cleaned.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            fl = fold(line)
+            if court == "TC":
+                if "ii. consideraciones y fundamentos" in fl:
+                    section = "DECIDING_COURT"
+                    continue
+                if section == "DECIDING_COURT" and fl == "del tribunal constitucional":
+                    continue
+                if re.match(r"^i\.\s*antecedentes", fl):
+                    section = "BACKGROUND"
+                    continue
+                if fl.startswith("decide:"):
+                    if current:
+                        units.append(current)
+                        current = None
+                    section = "DISPOSITIVE"
+                    continue
+            elif court == "SCJ":
+                # The deliberation heading can be split across lines or can
+                # omit the literal 'la Primera Sala, después de haber'.
+                if ("despues de haber deliberado" in fl or
+                    "luego de haber deliberado" in fl or
+                    "la sala, despues de deliberar" in fl):
+                    section = "DECIDING_COURT"
+                    continue
+                if fl in ("falla:", "decide:", "resuelve:"):
+                    if current:
+                        units.append(current)
+                        current = None
+                    section = "DISPOSITIVE"
+                    continue
+            if court == "TC":
+                m = (re.match(r"^(\d{1,2}\.\d{1,2})\.\s+", line)
+                     if section == "DECIDING_COURT" else None)
+                if m is None and section == "DECIDING_COURT":
+                    m = re.match(r"^(\d{1,2})\.\s+(?=[A-ZÁÉÍÓÚÑ])", line)
+            else:
+                m = (re.match(r"^(\d{1,3})[).]\s+", line)
+                     if section == "DECIDING_COURT" else None)
+            if m:
+                if current:
+                    units.append(current)
+                current = {"foundation_number": m.group(1), "page": page["page"],
+                           "end_page": page["page"], "lines": [line],
+                           "section": section}
+            elif current and section == current["section"]:
+                current["lines"].append(line)
+                current["end_page"] = page["page"]
+    if current:
+        units.append(current)
+    for u in units:
+        u["text"] = normalize_space(" ".join(u.pop("lines")))
+    return units
+
+
+def annotate_foundation_attribution(units: list[dict], court: str | None = None) -> list[dict]:
+    """Track nested quotations and party submissions; prefer uncertainty to false attribution."""
+    quoted=False
+    for u in units:
+        txt=u["text"]
+        if u.get("section")!="DECIDING_COURT":
+            u["attribution"]="NON_DECIDING_SECTION_REVIEW";u["attribution_indicators"]=["section_not_deciding_court"];continue
+        if court=="TC":
+            # TC reasons may quote SCJ, parties or jurisprudence. They remain mixed until reviewed.
+            attr, indicators=attribution_context(txt)
+            if attr=="UNDETERMINED_REQUIRES_CONTEXT":
+                attr="DECIDING_COURT_SECTION_REVIEW";indicators=["tc_own_considerations_section","requires_individual_review"]
+            u["attribution"]=attr;u["attribution_indicators"]=indicators;continue
+        # Explicit opening and closure of reproduced appellate reasoning.
+        if re.search(r"(?:ordenanza|sentencia|fallo)\s+(?:impugnada|recurrida).{0,100}(?:transcriben|transcribe|textualmente)|(?:la alzada|la corte a qua).{0,110}(?:transcri|motiv[oó].{0,30}siguientes)",txt,re.I):
+            quoted=True;u["attribution"]="LOWER_COURT_INTRODUCTION_REVIEW";u["attribution_indicators"]=["explicit_lower_court_quote_start"];continue
+        # An appellate quotation ends when the SCJ resumes its own numbered
+        # account of cassation submissions or analysis. In SCJ-PS-23-1546 the
+        # quotation is ground 2; ground 3 starts "El recurrente pretende".
+        # The previous implementation never saw that transition and marked
+        # grounds 3-31 as lower-court quotations.
+        quote_exit = re.search(
+            r"^(?:\d+[).]\s+)?(?:el recurrente pretende|la recurrente pretende|"
+            r"los recurrentes pretenden|la parte recurrente pretende|"
+            r"los recurridos pretenden|la parte recurrida pretende|"
+            r"en el desarrollo de su|seg[uú]n resulta del an[aá]lisis|"
+            r"de lo transcrito|de la transcripci[oó]n|"
+            r"del examen de la sentencia impugnada|"
+            r"del contenido de la sentencia impugnada|"
+            r"de la lectura de la sentencia impugnada)",
+            txt[:300], re.I)
+        if quoted and quote_exit:
+            quoted=False
+            attr, indicators=attribution_context(txt)
+            if attr=="UNDETERMINED_REQUIRES_CONTEXT":
+                attr="DECIDING_COURT_NARRATIVE_REVIEW"
+                indicators=["explicit_quote_scope_exit", "requires_individual_review"]
+            else:
+                indicators=["explicit_quote_scope_exit"]+indicators
+            u["attribution"]=attr;u["attribution_indicators"]=indicators;continue
+        if quoted:
+            u["attribution"]="LOWER_COURT_QUOTATION_REVIEW";u["attribution_indicators"]=["within_lower_court_quotation_scope"];continue
+        attr, indicators=attribution_context(txt)
+        if attr=="UNDETERMINED_REQUIRES_CONTEXT":
+            attr="DECIDING_COURT_SECTION_REVIEW";indicators=["scj_deliberation_section","requires_individual_review"]
+        u["attribution"]=attr;u["attribution_indicators"]=indicators
+    return units
+
+
+def find_relevant_passages(pages, issue, limit, court=None):
+    """Rank numbered grounds without silently discarding low-scoring grounds.
+
+    Scores are *priorities for human review*, not findings of authorship or
+    verified holdings. In particular, quoted lower-court reasoning is labeled
+    and deprioritized, never represented as the deciding court's ratio.
+    """
+    units = annotate_foundation_attribution(extract_numbered_foundations(pages, court), court)
+    candidates = []
+    for i, unit in enumerate(units):
+        attr = unit["attribution"]
+        score = score_passage(unit["text"], issue, attr)
+        if attr in ("DECIDING_COURT_SECTION_REVIEW", "DECIDING_COURT_NARRATIVE_REVIEW",
+                    "POSSIBLE_JUDICIAL_REASONING_REVIEW"):
+            score += 0.8
+        if attr.startswith("LOWER_COURT_"):
+            score -= 2.5
+        # A zero/negative score means LOW PRIORITY, not "not a foundation".
+        # Previously this filter removed 30 of 31 detected grounds.
+        preceding = units[i-1]["text"] if i else ""
+        following = units[i+1]["text"] if i+1 < len(units) else ""
+        candidates.append({
+            "page": unit["page"], "end_page": unit["end_page"],
+            "foundation_number": unit["foundation_number"],
+            "score": round(score, 3), "text": unit["text"][:1800],
+            "text_truncated": len(unit["text"]) > 1800,
+            "attribution": attr,
+            "attribution_indicators": unit["attribution_indicators"],
+            "preceding_context": preceding[-500:] or None,
+            "following_context": following[:500] or None,
+            "attribution_is_determinative": False,
+            "ratio_decidendi_verified": False,
+            "review_required": True,
+        })
+    # Favor passages mentioning the issue and judicial reasoning. A later
+    # numbered ground can be more useful than the first factual background.
+    candidates.sort(key=lambda x: (-x["score"], x["page"],
+                                   int(x["foundation_number"].split(".")[0])))
+    out = []
+    seen = set()
+    for c in candidates:
+        key = (c["foundation_number"], c["page"])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(c)
+        if len(out) >= limit:
+            break
+    return out
+
+def normalized_contains(haystack, needle): return fold(needle) in fold(haystack)
+
+@app.get("/health", operation_id="healthCheck")
+def health():
+    return {"ok":True,"service":"ELCOHE-JURIS RD Jurisprudence Actions","version":APP_VERSION}
+
+@app.get("/v1/tc/search", operation_id="searchTcDecisions")
+async def search_tc(q:str=Query(min_length=2), year:int|None=None, limit:int=Query(default=10,ge=1,le=20)):
+    params={"searchString":q,"searchCriteria":"","size":max(limit,10)}
+    if year: params["searchString"]=f"{q} {year}"
+    try:
+        async with httpx.AsyncClient(timeout=20,follow_redirects=True,headers={"User-Agent":"ELCOHE-JURIS-RD/1.5"}) as c:
+            r=await c.get(TC_SEARCH_URL,params=params); r.raise_for_status()
+    except httpx.HTTPError as e:
+        return {"status":"ERROR","message":f"No fue posible consultar el TC: {e}"}
+    soup=BeautifulSoup(r.text,"html.parser"); results=[]; seen=set(); pat=re.compile(r"TC/\d{3,4}/\d{2}",re.I)
+    for a in soup.find_all("a",href=True):
+        m=pat.search(normalize_space(a.get_text(" ",strip=True)))
+        if not m: continue
+        href=a["href"]
+        if href.startswith("/"): href="https://www.tribunalconstitucional.gob.do"+href
+        if href in seen: continue
+        seen.add(href); results.append({"court":"TC","decision_number":m.group(0).upper(),"source_url":href,"status":"LOCATED"})
+        if len(results)>=limit: break
+    return {"query":q,"source":str(r.url),"results":results,"status":"LOCATED_RESULTS" if results else "NO_RESULTS"}
+
+@app.get("/v1/scj/search-plan", operation_id="prepareScjSearch")
+def prepare_scj_search(q:str=Query(min_length=2), chamber:str|None=None, matter:str|None=None, year_from:int|None=None, year_to:int|None=None):
+    if year_from and year_to and year_from>year_to: raise HTTPException(400,"year_from no puede ser mayor que year_to.")
+    site_q=f'site:poderjudicial.gob.do "{q}"'
+    if chamber: site_q+=f' "{chamber}"'
+    if matter: site_q+=f' "{matter}"'
+    return {"query":q,"official_portal":SCJ_PORTAL_URL,"filters":{k:v for k,v in {"sala":chamber,"materia":matter,"desde":year_from,"hasta":year_to}.items() if v is not None},"web_queries":[site_q,f'site:poderjudicial.gob.do/wp-content/uploads "{q}" sentencia'],"status":"SEARCH_PLAN_ONLY"}
+
+@app.post("/v1/verify", operation_id="verifyOfficialDocument")
+async def verify_document(req:VerifyRequest):
+    doc=await fetch_document(str(req.url)); ex=extract_document_text(doc); court=detect_court(doc["host"],req.expected_court,ex["full_text"]); meta=extract_metadata_from_text(ex["full_text"],court)
+    expected_match = decision_number_matches(ex["full_text"],court,req.expected_number)
+    court_ok = court_matches(court, req.expected_court)
+    status="VERIFIED_SOURCE" if ex["extraction_ok"] and court_ok else "NOT_VERIFIED"
+    if not expected_match: status="NOT_VERIFIED"
+    return {"status":status,"official_domain":True,"court":court,"expected_court_match":court_ok,"final_url":doc["final_url"],"document_type":ex["document_type"],"page_count":ex["page_count"],"metadata":meta,"expected_number_match":expected_match,"sha256":doc["sha256"]}
+
+@app.post("/v1/analyze-decision", operation_id="analyzeOfficialDecision")
+async def analyze_official_decision(req:AnalyzeDecisionRequest):
+    doc=await fetch_document(str(req.url)); ex=extract_document_text(doc); court=detect_court(doc["host"],req.expected_court,ex["full_text"]); meta=extract_metadata_from_text(ex["full_text"],court)
+    expected_match=decision_number_matches(ex["full_text"],court,req.expected_number)
+    court_ok=court_matches(court,req.expected_court)
+    all_foundations = extract_numbered_foundations(ex["pages"], court)
+    passages=find_relevant_passages(ex["pages"],req.legal_issue,req.max_passages,court)
+    for passage in passages:
+        passage.update(context_for_page(ex["pages"],passage["page"]))
+    status="HOLDING_CANDIDATE" if ex["extraction_ok"] and court_ok and expected_match and passages else ("VERIFIED_SOURCE" if ex["extraction_ok"] and court_ok and expected_match else "NOT_VERIFIED")
+    return {"status":status,"official_source_verified":bool(ex["extraction_ok"] and court_ok and expected_match),"expected_court_match":court_ok,"expected_number_match":expected_match,"metadata":meta,"relevant_passages":passages,"extraction_diagnostics":{"numbered_foundations_detected":len(all_foundations),"foundation_numbers_detected":[u["foundation_number"] for u in all_foundations[:100]],"candidate_passages_returned":len(passages),"selection_limit":req.max_passages,"note":"La ausencia de un fundamento en candidatos no prueba su inexistencia en el PDF."},"jurisprudential_card":{"tribunal":court,"sala":meta.get("chamber"),"sentencia":meta.get("decision_number"),"fecha":meta.get("date"),"expediente":meta.get("case_number"),"estado_verificacion":status,"cuestion_juridica":req.legal_issue,"fundamentos_candidatos":passages,"ratio_decidendi":None,"regla_juridica":None,"review_required":True,"fuente_oficial":doc["final_url"],"paginas":ex["page_count"]},"source_url":doc["final_url"],"sha256":doc["sha256"]}
+
+@app.post("/v1/promote-holding", operation_id="promoteVerifiedHolding")
+async def promote_verified_holding(req:HoldingPromotionRequest):
+    doc=await fetch_document(str(req.url)); ex=extract_document_text(doc); court=detect_court(doc["host"],req.expected_court,ex["full_text"]); meta=extract_metadata_from_text(ex["full_text"],court)
+    reasons=[]; gates={}
+    official=allowed_host(doc["host"]) and ex["extraction_ok"]; gates["official_source"]=official
+    court_ok=court_matches(court,req.expected_court); gates["expected_court_match"]=court_ok
+    number_ok = decision_number_matches(ex["full_text"],court,req.expected_number)
+    gates["expected_number_match"]=number_ok
+    page_ok = 1<=req.support_page<=ex["page_count"]; gates["support_page_exists"]=page_ok
+    support_exact=False; issue_score=0.0; prop_score=0.0
+    if page_ok:
+        page_text=ex["pages"][req.support_page-1]["text"]
+        support_exact=normalized_contains(page_text,req.support_quote) or normalized_contains(strip_running_furniture(page_text),req.support_quote)
+        issue_score=overlap_ratio(req.legal_issue,req.support_quote)
+        prop_score=overlap_ratio(req.legal_proposition,req.support_quote)
+    context = locate_support_context(ex["pages"], req.support_page, req.support_quote)
+    support_located = context["located"]
+    # Assess the full unit, not a cherry-picked excerpt. Context never
+    # substitutes for the quote's exact presence on the declared page.
+    support_unit = context["unit"]
+    preceding = context["preceding"]
+    following = context["following"]
+    # A quotation that cannot be anchored to the declared page must not
+    # receive a positive authorship signal solely from the supplied input.
+    if support_located:
+        attribution, attribution_indicators = attribution_context(
+            support_unit, preceding, following
+        )
+    else:
+        attribution, attribution_indicators = "UNDETERMINED_REQUIRES_CONTEXT", ["support_unit_not_located"]
+    gates["support_attribution_heuristic"] = attribution
+    gates["support_unit_located"] = support_located
+    gates["support_context_preceding"] = preceding[-500:] if preceding else None
+    gates["support_context_following"] = following[:500] if following else None
+    gates["support_context_preceding_page"] = context["preceding_page"]
+    gates["support_context_following_page"] = context["following_page"]
+    gates["support_attribution_indicators"] = attribution_indicators
+    gates["support_unit_text_truncated"] = len(support_unit) > 1800
+    gates["support_quote_exact_on_page"]=support_exact
+    gates["support_quote_raw_match"]=normalized_contains(ex["pages"][req.support_page-1]["text"], req.support_quote) if page_ok else False
+    gates["support_quote_cleaned_match"]=normalized_contains(strip_running_furniture(ex["pages"][req.support_page-1]["text"]), req.support_quote) if page_ok else False
+    gates["issue_grounding_score"]=round(issue_score,3)
+    gates["proposition_grounding_score"]=round(prop_score,3)
+    outcome_ok=bool(req.outcome_quote and req.outcome_page)
+    if req.outcome_quote:
+        if not req.outcome_page or not (1<=req.outcome_page<=ex["page_count"]): outcome_ok=False
+        else: outcome_ok=normalized_contains(ex["pages"][req.outcome_page-1]["text"],req.outcome_quote)
+    gates["outcome_quote_verified"]=outcome_ok
+    gates["judicial_reasoning_reviewed"]=req.judicial_reasoning_reviewed
+    if not court_ok: reasons.append("El tribunal no pudo confirmarse en el contenido del documento.")
+    if not req.judicial_reasoning_reviewed: reasons.append("Falta revisión humana de autoría y contexto del fundamento.")
+    if not number_ok: reasons.append("Número esperado no confirmado.")
+    if not support_exact: reasons.append("Pasaje no encontrado íntegramente en la página indicada.")
+    if not support_located: reasons.append("La cita no pudo vincularse a una unidad argumentativa completa.")
+    if attribution != "POSSIBLE_JUDICIAL_REASONING_REVIEW": reasons.append("No se acreditó atribución judicial positiva mediante los indicios disponibles; revisión de contexto necesaria.")
+    reviewer_ok = bool(req.reviewer_name and req.reviewer_confirmation == "CONFIRMO_LECTURA_INTEGRAL")
+    gates["reviewer_attestation"] = reviewer_ok
+    if not reviewer_ok: reasons.append("Falta identificación y declaración expresa de revisión integral del revisor.")
+    if issue_score<0.15: reasons.append("Conexión insuficiente con la cuestión jurídica.")
+    if prop_score<0.18: reasons.append("Anclaje insuficiente de la proposición en el pasaje.")
+    if not outcome_ok: reasons.append("Resultado/dispositivo no verificado.")
+    ok=official and court_ok and req.judicial_reasoning_reviewed and number_ok and page_ok and support_exact and support_located and attribution == "POSSIBLE_JUDICIAL_REASONING_REVIEW" and reviewer_ok and issue_score>=0.15 and prop_score>=0.18 and outcome_ok
+    if not official: reasons.append("Documento oficial no confirmado o extracción insuficiente.")
+    if ok: reasons.append("Los controles heurísticos no acreditan por sí solos la ratio decidendi; no se emite certificación automática.")
+    return {"status":"HOLDING_REQUIRES_INDEPENDENT_LEGAL_REVIEW" if ok else "HOLDING_NOT_PROMOTED","court":court,"metadata":meta,"legal_issue":req.legal_issue,"legal_proposition":None,"support":{"page":req.support_page,"quote":req.support_quote if support_exact else None,"outcome_page":req.outcome_page,"outcome_quote":req.outcome_quote if outcome_ok else None},"gates":gates,"reasons":reasons,"verification_note":"La verificación documental y los indicadores de atribución no prueban por sí mismos la ratio decidendi. Requiere juicio jurídico humano y cotejo del dispositivo.","source_url":doc["final_url"],"sha256":doc["sha256"]}
