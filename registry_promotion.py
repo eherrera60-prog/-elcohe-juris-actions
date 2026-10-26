@@ -12,9 +12,9 @@ from typing import Literal
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field, model_validator
 
-from registry import connect, init_schema, require_admin
+from registry import connect, init_schema, require_admin, require_read_access
 
-router = APIRouter(prefix="/v1/registry", tags=["Aprobación jurídica humana"], dependencies=[Depends(require_admin)])
+router = APIRouter(prefix="/v1/registry", tags=["Aprobación jurídica humana"])
 
 CONFIRMATION = "CONFIRMO_LECTURA_INTEGRAL"
 
@@ -76,7 +76,7 @@ def _digest(req: LegalApprovalRequest) -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
-@router.post("/holdings/approve", operation_id="approveReviewedHolding")
+@router.post("/holdings/approve", operation_id="approveReviewedHolding", dependencies=[Depends(require_admin)])
 async def approve_reviewed_holding(req: LegalApprovalRequest):
     """Aprobación por revisor declarado. Verifica nuevamente PDF oficial y citas antes de escritura."""
     from app import fetch_document, extract_document_text, detect_court, court_matches, decision_number_matches, normalized_contains, strip_running_furniture, locate_support_context, attribution_context
@@ -160,7 +160,7 @@ async def approve_reviewed_holding(req: LegalApprovalRequest):
         raise HTTPException(503, f"No se pudo guardar la aprobación ({type(exc).__name__}).")
 
 
-@router.get("/holdings/{decision_id}", operation_id="getReviewedHolding")
+@router.get("/holdings/{decision_id}", operation_id="getReviewedHolding", dependencies=[Depends(require_read_access)])
 def get_reviewed_holding(decision_id: int):
     if decision_id < 1:
         raise HTTPException(422, "Identificador inválido.")

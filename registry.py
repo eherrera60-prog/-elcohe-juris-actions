@@ -26,6 +26,21 @@ def require_admin(x_elcohe_admin_token: str | None = Header(default=None)):
         raise HTTPException(401, "Token de registro inválido.")
 
 
+def require_read_access(x_elcohe_admin_token: str | None = Header(default=None),
+                        x_elcohe_read_token: str | None = Header(default=None)):
+    """Read-only token or existing admin token. Writes remain admin-only."""
+    admin = os.getenv("ELCOHE_REGISTRY_ADMIN_TOKEN", "")
+    reader = os.getenv("ELCOHE_REGISTRY_READ_TOKEN", "")
+    if not reader:
+        raise HTTPException(503, "Acceso de lectura no configurado: falta ELCOHE_REGISTRY_READ_TOKEN.")
+    if admin and hmac.compare_digest(reader, admin):
+        raise HTTPException(503, "Los tokens de lectura y administración deben ser diferentes.")
+    read_ok = bool(x_elcohe_read_token and hmac.compare_digest(x_elcohe_read_token, reader))
+    admin_ok = bool(admin and x_elcohe_admin_token and hmac.compare_digest(x_elcohe_admin_token, admin))
+    if not (read_ok or admin_ok):
+        raise HTTPException(401, "Credencial de consulta inválida.")
+
+
 def db_url() -> str:
     url = os.getenv("DATABASE_URL", "").strip()
     if not url:
@@ -132,7 +147,7 @@ async def register_decision(req: RegisterRequest):
         raise HTTPException(503, f"Error al guardar la decisión ({type(exc).__name__}).")
 
 
-@router.get("/decisions", operation_id="listRegisteredDecisions", dependencies=[Depends(require_admin)])
+@router.get("/decisions", operation_id="listRegisteredDecisions", dependencies=[Depends(require_read_access)])
 def list_decisions(court: str | None = Query(default=None, pattern=r"^(SCJ|TC)$"),
                    decision_number: str | None = Query(default=None, max_length=80),
                    limit: int = Query(default=20, ge=1, le=100),
@@ -161,7 +176,7 @@ def list_decisions(court: str | None = Query(default=None, pattern=r"^(SCJ|TC)$"
         raise HTTPException(503, f"Error al consultar el registro ({type(exc).__name__}).")
 
 
-@router.get("/decisions/{decision_id}", operation_id="getRegisteredDecision", dependencies=[Depends(require_admin)])
+@router.get("/decisions/{decision_id}", operation_id="getRegisteredDecision", dependencies=[Depends(require_read_access)])
 def get_decision(decision_id: int):
     if decision_id < 1:
         raise HTTPException(422, "Identificador inválido.")
