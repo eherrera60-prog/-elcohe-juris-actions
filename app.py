@@ -40,6 +40,15 @@ class AnalyzeDecisionRequest(BaseModel):
     legal_issue: str | None = None
     max_passages: int = Field(default=6, ge=1, le=12)
 
+class DecisionExcerptRequest(BaseModel):
+    """Retrieve bounded, page-anchored text from an official judgment."""
+    url: HttpUrl
+    expected_court: str
+    expected_number: str
+    page: int = Field(ge=1)
+    query: str | None = Field(default=None, min_length=3, max_length=180)
+    max_chars: int = Field(default=5000, ge=200, le=10000)
+
 class HoldingPromotionRequest(BaseModel):
     url: HttpUrl
     expected_court: str
@@ -616,6 +625,58 @@ async def analyze_official_decision(req:AnalyzeDecisionRequest):
         passage.update(context_for_page(ex["pages"],passage["page"]))
     status="HOLDING_CANDIDATE" if ex["extraction_ok"] and court_ok and expected_match and passages else ("VERIFIED_SOURCE" if ex["extraction_ok"] and court_ok and expected_match else "NOT_VERIFIED")
     return {"status":status,"official_source_verified":bool(ex["extraction_ok"] and court_ok and expected_match),"expected_court_match":court_ok,"expected_number_match":expected_match,"metadata":meta,"relevant_passages":passages,"extraction_diagnostics":{"numbered_foundations_detected":len(all_foundations),"foundation_numbers_detected":[u["foundation_number"] for u in all_foundations[:100]],"candidate_passages_returned":len(passages),"selection_limit":req.max_passages,"note":"La ausencia de un fundamento en candidatos no prueba su inexistencia en el PDF."},"jurisprudential_card":{"tribunal":court,"sala":meta.get("chamber"),"sentencia":meta.get("decision_number"),"fecha":meta.get("date"),"expediente":meta.get("case_number"),"estado_verificacion":status,"cuestion_juridica":req.legal_issue,"fundamentos_candidatos":passages,"ratio_decidendi":None,"regla_juridica":None,"review_required":True,"fuente_oficial":doc["final_url"],"paginas":ex["page_count"]},"source_url":doc["final_url"],"sha256":doc["sha256"]}
+
+@app.post("/v1/decision-excerpt", operation_id="readOfficialDecisionExcerpt")
+async def read_official_decision_excerpt(req: DecisionExcerptRequest):
+    """Expose original extraction for precise quotation, not a judicial holding.
+
+    Query is optional. When provided, return a bounded window around the first
+    normalized occurrence, and an exact-match flag. Do not silently 'repair'
+    extraction artifacts or cross page boundaries.
+    """
+    doc = await fetch_document(str(req.url))
+    ex = extract_document_text(doc)
+    court = detect_court(doc["host"], req.expected_court, ex["full_text"])
+    if not (allowed_host(doc["host"]) and ex["extraction_ok"]
+            and court_matches(court, req.expected_court)
+            and decision_number_matches(ex["full_text"], court, req.expected_number)):
+        raise HTTPException(422, "Identidad o fuente oficial no verificadas.")
+    if req.page > ex["page_count"]:
+        raise HTTPException(422, "Página fuera del documento.")
+    raw = ex["pages"][req.page - 1]["text"]
+    cleaned = strip_running_furniture(raw)
+    # Search a whitespace-normalized copy to keep offsets stable and expose
+    # only literal extracted content, not an inferred or paraphrased passage.
+    searchable = normalize_space(cleaned)
+    found = None
+    occurrence_count = None
+    if req.query:
+        # Count matching occurrences for transparency. This is not a legal finding.
+        haystack, needle = fold(searchable), fold(req.query)
+        found = haystack.find(needle)
+        occurrence_count = haystack.count(needle)
+    if found is not None and found >= 0:
+        start = max(0, found - req.max_chars // 3)
+    else:
+        start = 0
+    end = min(len(searchable), start + req.max_chars)
+    return {
+        "status": "EXTRACTED_TEXT_REQUIRES_LEGAL_REVIEW",
+        "metadata": extract_metadata_from_text(ex["full_text"], court),
+        "page": req.page,
+        "page_count": ex["page_count"],
+        "query_found": found >= 0 if found is not None else None,
+        "query_occurrences_on_page": occurrence_count,
+        "excerpt": searchable[start:end],
+        "excerpt_start": start,
+        "excerpt_end": end,
+        "page_text_length": len(searchable),
+        "excerpt_truncated": start > 0 or end < len(searchable),
+        "source_url": doc["final_url"],
+        "sha256": doc["sha256"],
+        "ratio_decidendi_verified": False,
+        "review_required": True,
+    }
 
 @app.post("/v1/promote-holding", operation_id="promoteVerifiedHolding")
 async def promote_verified_holding(req:HoldingPromotionRequest):
