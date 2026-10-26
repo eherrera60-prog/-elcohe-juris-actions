@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, HttpUrl, Field
 from pypdf import PdfReader
 
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.6.1"
 MAX_DOCUMENT_BYTES = 12 * 1024 * 1024
 MAX_PDF_PAGES = 350
 MAX_REDIRECTS = 3
@@ -747,3 +747,7 @@ async def promote_verified_holding(req:HoldingPromotionRequest):
 # Registro persistente opcional; sin DATABASE_URL no altera los endpoints existentes.
 from registry import router as registry_router
 app.include_router(registry_router)
+
+# Aprobación jurídica humana auditable (sin modificar los endpoints legados).
+from registry_promotion import router as registry_promotion_router
+app.include_router(registry_promotion_router)
