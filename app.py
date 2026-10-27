@@ -581,8 +581,16 @@ def health():
 async def search_tc(q: str = Query(min_length=2), year: int | None = None,
                     limit: int = Query(default=10, ge=1, le=20)):
     """Locate candidates on the official TC portal; never certify a holding here."""
-    search_term = f"{q} {year}" if year else q
-    params = {"searchString": search_term, "searchCriteria": "", "size": max(limit, 10)}
+    # The official TC form filters years separately; appending the year to
+    # searchString changes the query and does not activate the year filter.
+    search_term = q.strip()
+    params = {"searchString": search_term, "size": 999999 if year else max(limit, 10)}
+    if year is not None:
+        if year < 2012 or year > 2100:
+            raise HTTPException(status_code=422, detail="Año de sentencia fuera del rango permitido.")
+        params.update({"filtery": str(year), "criteriay": "years"})
+    else:
+        params["searchCriteria"] = ""
     headers = {"User-Agent": f"ELCOHE-JURIS-RD/{APP_VERSION}",
                "Accept": "text/html,application/xhtml+xml"}
     try:
