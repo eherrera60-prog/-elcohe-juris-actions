@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, HttpUrl, Field
 from pypdf import PdfReader
 
-APP_VERSION = "1.6.1"
+APP_VERSION = "1.6.2"
 MAX_DOCUMENT_BYTES = 12 * 1024 * 1024
 MAX_PDF_PAGES = 350
 MAX_REDIRECTS = 3
@@ -339,7 +339,7 @@ async def fetch_document(url: str):
     current = url
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(35, connect=10), follow_redirects=False,
-                                     headers={"User-Agent": "ELCOHE-JURIS-RD/1.5.9"}, trust_env=False) as client:
+                                     headers={"User-Agent": "ELCOHE-JURIS-RD/1.6.2"}, trust_env=False) as client:
             for hop in range(MAX_REDIRECTS + 1):
                 validate_official_url(current)
                 async with client.stream("GET", current) as response:
@@ -613,6 +613,62 @@ async def verify_document(req:VerifyRequest):
     status="VERIFIED_SOURCE" if ex["extraction_ok"] and court_ok else "NOT_VERIFIED"
     if not expected_match: status="NOT_VERIFIED"
     return {"status":status,"official_domain":True,"court":court,"expected_court_match":court_ok,"final_url":doc["final_url"],"document_type":ex["document_type"],"page_count":ex["page_count"],"metadata":meta,"expected_number_match":expected_match,"sha256":doc["sha256"]}
+
+
+class OfficialPdfRequest(BaseModel):
+    url: HttpUrl
+    expected_court: str
+    expected_number: str
+
+@app.post("/v1/resolve-official-pdf", operation_id="resolveOfficialPdf")
+async def resolve_official_pdf(req: OfficialPdfRequest):
+    """Find official PDF candidates on an official HTML page; do not claim they were verified."""
+    doc = await fetch_document(str(req.url))
+    if doc["data"][:4] == b"%PDF":
+        return {"status": "PDF_CANDIDATE", "candidates": [doc["final_url"]],
+                "note": "Use verifyOfficialPdf to examine this document."}
+    if "html" not in doc["content_type"]:
+        raise HTTPException(415, "La fuente no es HTML ni PDF.")
+    soup = BeautifulSoup(doc["text_response"] or "", "html.parser")
+    candidates = []
+    for element in soup.select('a[href], iframe[src], embed[src], object[data]'):
+        href = element.get('href') or element.get('src') or element.get('data')
+        if not href:
+            continue
+        url = urljoin(doc["final_url"], href)
+        parsed = urlparse(url)
+        if parsed.scheme != "https" or not allowed_host(parsed.hostname):
+            continue
+        if not parsed.path.lower().endswith('.pdf'):
+            continue
+        if url not in candidates:
+            candidates.append(url)
+        if len(candidates) >= 20:
+            break
+    return {"status": "PDF_CANDIDATES_FOUND" if candidates else "PDF_NOT_DISCOVERED",
+            "candidates": candidates, "source_url": doc["final_url"],
+            "note": "Los enlaces son candidatos; la identidad y el contenido requieren verifyOfficialPdf."}
+
+@app.post("/v1/verify-official-pdf", operation_id="verifyOfficialPdf")
+async def verify_official_pdf(req: OfficialPdfRequest):
+    """Validate actual PDF bytes and extract text, without certifying a judicial holding."""
+    doc = await fetch_document(str(req.url))
+    if doc["data"][:4] != b"%PDF":
+        return {"status": "NOT_PDF", "source_url": doc["final_url"],
+                "content_type": doc["content_type"],
+                "note": "La ficha HTML no equivale al PDF judicial."}
+    ex = extract_document_text(doc)
+    court = detect_court(doc["host"], req.expected_court, ex["full_text"])
+    court_ok = court_matches(court, req.expected_court)
+    number_ok = decision_number_matches(ex["full_text"], court, req.expected_number)
+    ok = ex["extraction_ok"] and court_ok and number_ok
+    return {"status": "PDF_TEXT_VERIFIED" if ok else "PDF_REQUIRES_REVIEW",
+            "court": court, "expected_court_match": court_ok,
+            "expected_number_match": number_ok, "text_extraction_ok": ex["extraction_ok"],
+            "page_count": ex["page_count"], "source_url": doc["final_url"],
+            "sha256_pdf": doc["sha256"], "document_type": "PDF",
+            "ratio_decidendi_verified": False, "review_required": True,
+            "note": "Para cotejar fundamentos concretos utilice readOfficialDecisionExcerpt con páginas específicas."}
 
 @app.post("/v1/analyze-decision", operation_id="analyzeOfficialDecision")
 async def analyze_official_decision(req:AnalyzeDecisionRequest):
