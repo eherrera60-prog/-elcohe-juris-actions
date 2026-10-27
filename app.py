@@ -885,3 +885,5 @@ app.include_router(registry_router)
 # Aprobación jurídica humana auditable (sin modificar los endpoints legados).
 from registry_promotion import router as registry_promotion_router
 app.include_router(registry_promotion_router)
+from juris_163 import install
+install(app)
