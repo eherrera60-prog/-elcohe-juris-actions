@@ -91,7 +91,7 @@ def _primary_identifier(text: str) -> tuple[str, str] | None:
     opening = (text or "")[:4500]
     patterns = (
         ("TC", re.compile(r"\bTC/\d{3,4}/\d{2}\b", re.I)),
-        ("SCJ", re.compile(r"\bSCJ-[A-Z]{2}-\d{2}-\d{3,5}\b", re.I)),
+        ("SCJ", re.compile(r"\bSCJ-[A-Z]{2}-(?:\d{2}|\d{4})-\d{3,5}\b", re.I)),
     )
     candidates = sorted(
         (match.start(), match.end(), court, match.group(0).upper())
@@ -199,7 +199,7 @@ def clean_page_text(text: str) -> str:
     # SCJ footer can be injected in the middle of a judicial paragraph by pypdf.
     # Match the complete identifying footer rather than deleting arbitrary lines.
     text = re.sub(
-        r"SCJ-[A-Z]{2}-\d{2}-\d{3,5}\s+Nacional,\s*Rep\.?\s*Dom\.?\s*"
+        r"SCJ-[A-Z]{2}-(?:\d{2}|\d{4})-\d{3,5}\s+Nacional,\s*Rep\.?\s*Dom\.?\s*"
         r"Tel\.?\s*:\s*\(?\d{3}\)?\s*\d{3}[-–]\d{4}\s*[•·]?\s*"
         r"Direcci[oó]n\s+de\s+Internet\s*:\s*https?\s*:\s*//\s*"
         r"(?:www\.)?poderjudicial\.gob\.do\s*PR\s*/\s*p[aá]g\.?\s*\d+",
@@ -231,6 +231,24 @@ SPANISH_NUMBERS = {"uno":1,"dos":2,"tres":3,"cuatro":4,"cinco":5,"seis":6,"siete
     "veintitres":23,"veintitrés":23,"veinticuatro":24,"veinticinco":25,
     "veintiseis":26,"veintiséis":26,"veintisiete":27,"veintiocho":28,
     "veintinueve":29,"treinta":30,"treinta y uno":31}
+
+def extract_source_date(text: str, *, require_issuance_marker: bool = False) -> str | None:
+    source = text or ""
+    if not require_issuance_marker:
+        numeric = re.search(
+            r"\b(?:20\d{2}-\d{2}-\d{2}|\d{1,2}[/-]\d{1,2}[/-]20\d{2})\b",
+            source,
+        )
+        if numeric:
+            return numeric.group(0)
+    issuance_date = re.search(
+        r"\ben fecha\s+(\d{1,2}\s+de\s+(?:"
+        + "|".join(MONTHS)
+        + r")\s+de\s+20\d{2})\b",
+        source,
+        re.I,
+    )
+    return normalize_space(issuance_date.group(1)) if issuance_date else None
 
 def extract_metadata_from_text(text: str, court: str | None) -> dict[str, Any]:
     """Extract identifying fields from the opening, never from cited judgments."""
@@ -444,6 +462,12 @@ async def fetch_document(url: str):
                             "sha256": hashlib.sha256(data).hexdigest()}
     except HTTPException:
         raise
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(
+            502,
+            "No fue posible obtener el documento oficial: "
+            f"HTTP {exc.response.status_code}.",
+        ) from exc
     except (httpx.HTTPError, ValueError, OSError) as exc:
         raise HTTPException(502, f"No fue posible obtener el documento oficial: {type(exc).__name__}")
     raise HTTPException(502, "No se obtuvo el documento.")
@@ -665,13 +689,13 @@ def normalized_contains(haystack, needle): return fold(needle) in fold(haystack)
 def health():
     return {"ok":True,"service":"ELCOHE-JURIS RD Jurisprudence Actions","version":APP_VERSION}
 
-@app.get("/v1/tc/search", operation_id="searchTcDecisions")
-async def search_tc(q: str = Query(min_length=2), year: int | None = None,
-                    limit: int = Query(default=10, ge=1, le=20)):
+async def _search_tc_candidates(q: str, year: int | None, limit: int) -> dict:
     """Locate candidates on the official TC portal; never certify a holding here."""
     # The official TC form filters years separately; appending the year to
     # searchString changes the query and does not activate the year filter.
-    search_term = q.strip()
+    search_term = normalize_space(q)
+    if len(search_term) < 2:
+        raise HTTPException(status_code=422, detail="q debe contener al menos dos caracteres no blancos.")
     params = {"searchString": search_term, "size": max(limit, 10)}
     if year is not None:
         if year < 2012 or year > 2100:
@@ -687,23 +711,60 @@ async def search_tc(q: str = Query(min_length=2), year: int | None = None,
             response = await client.get(TC_SEARCH_URL, params=params)
             response.raise_for_status()
     except (httpx.HTTPError, httpx.TooManyRedirects) as exc:
-        return {"query": q, "results": [], "status": "SOURCE_UNAVAILABLE",
+        return {"query": search_term, "search_executed": False,
+                "results": [], "status": "ACCESS_FAILED",
                 "message": "No se pudo consultar el portal oficial del TC.",
-                "error_type": type(exc).__name__}
+                "error_type": type(exc).__name__,
+                "http_status": exc.response.status_code
+                if isinstance(exc, httpx.HTTPStatusError) else None}
 
     final_url = str(response.url)
     if not allowed_host(response.url.host):
-        return {"query": q, "results": [], "status": "SOURCE_UNVERIFIED",
+        return {"query": search_term, "search_executed": False,
+                "results": [], "status": "ACCESS_FAILED",
                 "message": "La consulta redirigió fuera de los dominios oficiales permitidos."}
     content_type = response.headers.get("content-type", "").lower()
     if "html" not in content_type:
-        return {"query": q, "source": final_url, "results": [],
-                "status": "EXTRACTION_UNVERIFIED",
+        return {"query": search_term, "source": final_url,
+                "search_executed": True, "results": [],
+                "status": "EXTRACTION_FAILED",
                 "message": "El portal no devolvió una página HTML interpretable."}
 
     soup = BeautifulSoup(response.text, "html.parser")
+    search_input = soup.find("input", id="searchString")
+    echoed_query = normalize_space(
+        search_input.get("value", "") if search_input else ""
+    )
+    query_echo_matches = echoed_query.casefold() == search_term.casefold()
+    if not query_echo_matches:
+        return {
+            "query": search_term,
+            "source": final_url,
+            "search_executed": False,
+            "results": [],
+            "status": "EXTRACTION_FAILED",
+            "message": "La página oficial no confirmó la consulta solicitada.",
+        }
+    if year is not None:
+        selected_year = re.search(
+            r'(?m)\bvar\s+filter\s*=\s*["\']?(\d{4})["\']?\s*;',
+            response.text,
+        )
+        if not selected_year or int(selected_year.group(1)) != year:
+            return {
+                "query": search_term,
+                "source": final_url,
+                "search_executed": False,
+                "results": [],
+                "status": "EXTRACTION_FAILED",
+                "message": "La página oficial no confirmó el filtro de año solicitado.",
+            }
+
     pattern = re.compile(r"\bTC\s*/\s*\d{3,4}\s*/\s*\d{2}\b", re.I)
-    exact = pattern.search(q)
+    page_has_decision_reference = bool(
+        pattern.search(soup.get_text(" ", strip=True))
+    )
+    exact = pattern.search(search_term)
     expected = re.sub(r"\s+", "", exact.group(0)).upper() if exact else None
     results, seen = [], set()
     for anchor in soup.find_all("a", href=True):
@@ -717,14 +778,14 @@ async def search_tc(q: str = Query(min_length=2), year: int | None = None,
         # number elsewhere on the page as proof that this link is its judgment.
         label = normalize_space(anchor.get_text(" ", strip=True))
         label += " " + normalize_space(anchor.get("title", ""))
+        parent = anchor.find_parent(["article", "li", "tr"])
+        nearby = normalize_space(parent.get_text(" ", strip=True)) if parent else ""
+        if len(nearby) > 1200 or (parent and len(parent.find_all("a", href=True)) > 3):
+            nearby = ""
         number = pattern.search(label)
         if not number:
-            parent = anchor.find_parent(["article", "li", "tr"])
-            if parent is not None:
-                nearby = normalize_space(parent.get_text(" ", strip=True))
-                # Avoid associating an unrelated navigation link with a ruling.
-                if len(nearby) <= 1200 and len(parent.find_all("a", href=True)) <= 3:
-                    number = pattern.search(nearby)
+            # Avoid associating an unrelated navigation link with a ruling.
+            number = pattern.search(nearby)
         if not number:
             # Some official PDF links contain the judgment number in their URL.
             # Restrict this fallback to PDF filenames, not arbitrary URLs.
@@ -747,33 +808,104 @@ async def search_tc(q: str = Query(min_length=2), year: int | None = None,
         if key in seen:
             continue
         seen.add(key)
-        results.append({"court": "TC", "decision_number": decision_number,
-                        "source_url": href, "status": "LOCATED_UNVERIFIED",
-                        "verification_status": "CANDIDATE",
-                        "source_status": "NOT_VERIFIED",
-                        "identity_status": "NOT_VERIFIED",
-                        "passage_status": "NOT_VERIFIED",
-                        "official_document_verified": False,
-                        "ratio_decidendi_verified": False})
+        source_text = label
+        if nearby:
+            source_text += " " + nearby
+        candidate = {
+            "court": "TC",
+            "decision_number": decision_number,
+            "source_url": href,
+            "status": "CANDIDATE",
+            "verification_status": "CANDIDATE",
+            "source_status": "NOT_VERIFIED",
+            "identity_status": "NOT_VERIFIED",
+            "passage_status": "NOT_VERIFIED",
+            "official_document_verified": False,
+            "ratio_decidendi_verified": False,
+        }
+        tribunal = re.search(
+            r"\bTribunal Constitucional(?: de la República Dominicana)?\b",
+            source_text,
+            re.I,
+        )
+        if tribunal:
+            candidate["tribunal"] = normalize_space(tribunal.group(0))
+        date = extract_source_date(source_text)
+        if date:
+            candidate["date"] = date
+        results.append(candidate)
         if len(results) >= limit:
             break
 
     if results:
-        status, message = "LOCATED_RESULTS", "Coincidencias localizadas; verificar cada sentencia oficial antes de atribuir criterios."
+        status, message = "CANDIDATES_FOUND", "Coincidencias localizadas; verificar cada sentencia oficial antes de atribuir criterios."
+    elif not page_has_decision_reference and any(
+        normalize_space(heading.get_text(" ", strip=True)).casefold()
+        == "no hay resultados para mostrar"
+        for heading in soup.find_all(["h3", "h4"])
+    ):
+        status = "NO_RESULTS_CONFIRMED"
+        message = (
+            "El portal TC mostró explícitamente cero resultados para esta consulta; "
+            "esto no demuestra que no existan otras sentencias."
+        )
     else:
-        # A 200 response and no recognizable links do not establish that the
-        # tribunal has no such decision: JS rendering and markup may differ.
-        status, message = "EXTRACTION_UNVERIFIED", "No se identificaron enlaces de sentencias en el HTML recibido; no equivale a inexistencia de resultados."
-    return {"query": q, "source": final_url, "results": results,
+        status, message = (
+            "EXTRACTION_FAILED",
+            "No se identificaron enlaces de sentencias ni un estado oficial explícito de cero resultados.",
+        )
+    return {"query": search_term, "source": final_url,
+            "search_executed": True, "results": results,
             "status": status, "message": message}
+
+
+@app.get("/v1/tc/search", operation_id="searchTcDecisions")
+async def search_tc_decisions(
+    q: str = Query(min_length=2),
+    year: int | None = None,
+    limit: int = Query(default=10, ge=1, le=20),
+):
+    return await _search_tc_candidates(q, year, limit)
+
+
+async def search_tc(q: str, year: int | None = None, limit: int = 10) -> dict:
+    """Keep the legacy integrated-search status while the API uses explicit states."""
+    result = await _search_tc_candidates(q, year, limit)
+    if result["status"] == "CANDIDATES_FOUND":
+        result["status"] = "LOCATED_RESULTS"
+    return result
+
 
 @app.get("/v1/scj/search-plan", operation_id="prepareScjSearch")
 def prepare_scj_search(q:str=Query(min_length=2), chamber:str|None=None, matter:str|None=None, year_from:int|None=None, year_to:int|None=None):
-    if year_from and year_to and year_from>year_to: raise HTTPException(400,"year_from no puede ser mayor que year_to.")
-    site_q=f'site:poderjudicial.gob.do "{q}"'
-    if chamber: site_q+=f' "{chamber}"'
-    if matter: site_q+=f' "{matter}"'
-    return {"query":q,"official_portal":SCJ_PORTAL_URL,"filters":{k:v for k,v in {"sala":chamber,"materia":matter,"desde":year_from,"hasta":year_to}.items() if v is not None},"web_queries":[site_q,f'site:poderjudicial.gob.do/wp-content/uploads "{q}" sentencia'],"status":"SEARCH_PLAN_ONLY"}
+    query = normalize_space(q)
+    if len(query) < 2:
+        raise HTTPException(422, "q debe contener al menos dos caracteres no blancos.")
+    if year_from is not None and year_to is not None and year_from > year_to:
+        raise HTTPException(400, "year_from no puede ser mayor que year_to.")
+    if (year_from is None) != (year_to is None):
+        raise HTTPException(422, "Para preparar un rango SCJ se requieren year_from y year_to.")
+    if year_from is not None and (year_from < 1908 or year_to > 2100):
+        raise HTTPException(422, "Año SCJ fuera del rango permitido.")
+    if year_from is not None and year_to - year_from > 10:
+        raise HTTPException(422, "El rango SCJ no puede superar 10 años por consulta.")
+    return {
+        "query": query,
+        "official_portal": SCJ_PORTAL_URL,
+        "filters": {
+            key: value for key, value in {
+                "sala": chamber, "materia": matter,
+                "desde": year_from, "hasta": year_to,
+            }.items() if value is not None
+        },
+        "search_executed": False,
+        "filters_applied": False,
+        "limitations": [
+            "Este endpoint solo prepara una consulta; no accede al portal SCJ.",
+            "Los filtros solo se aplican al ejecutar /v1/scj/search.",
+        ],
+        "status": "SEARCH_PLAN_ONLY",
+    }
 
 @app.post("/v1/verify", operation_id="verifyOfficialDocument")
 async def verify_document(req:VerifyRequest):

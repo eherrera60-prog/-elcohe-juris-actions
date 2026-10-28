@@ -13,7 +13,8 @@ Dominicana.
 - `POST /v1/verify-official-pdf`: valida la extracción e identidad declarada de
   un PDF oficial.
 - `POST /v1/extract-foundations`: revalida el PDF oficial y su identidad, y
-  extrae fundamentos numerados con tribunal, número, fecha y página.
+  extrae fundamentos numerados con los metadatos y páginas que puedan
+  comprobarse en el documento.
 
 Los resultados de búsqueda son `CANDIDATE`, no decisiones verificadas. La
 extracción distingue `VERIFIED_SOURCE`, `VERIFIED_IDENTITY`,
@@ -22,8 +23,22 @@ confirma que el texto extraído aparece en la página indicada del PDF; no
 certifica la autoría judicial ni que el pasaje sea ratio decidendi. No se
 atribuyen criterios automáticamente.
 
-La búsqueda SCJ usa el formulario público y su endpoint DataTables publicado
-por el portal. Si el portal devuelve cero registros, la API informa que la
-respuesta no incluyó candidatos; esto no acredita que la sentencia no exista.
-Filtros de cámara y materia deben coincidir con las opciones vigentes del
-portal. Los rangos de años se limitan a diez años por consulta.
+Las búsquedas usan estos estados:
+
+- `SEARCH_PLAN_ONLY`: solo se preparó una consulta; no se contactó el portal.
+- `CANDIDATES_FOUND`: se localizaron enlaces o registros oficiales candidatos,
+  aún pendientes de verificar.
+- `NO_RESULTS_CONFIRMED`: la fuente devolvió explícitamente cero resultados para
+  la consulta y los filtros indicados; no demuestra que la sentencia no exista.
+- `EXTRACTION_FAILED`: hubo respuesta, pero no se pudo validar la consulta, sus
+  filtros o la estructura de resultados.
+- `ACCESS_FAILED`: no se completó el acceso a la fuente oficial.
+
+La búsqueda SCJ usa el formulario público y el endpoint DataTables publicado
+por el portal. Sala, materia y año se traducen a los valores vigentes del
+formulario; los rangos de años se consultan por año y se limitan a diez años.
+El archivo institucional alternativo no aplica esos filtros y su estado se
+informa aparte. En el TC, la consulta confirma el término y el año reflejados
+por la página oficial. Los números, fechas, tribunales y enlaces se devuelven
+solo cuando aparecen en los datos de la fuente. Un HTTP 200 por sí solo no
+confirma una búsqueda satisfactoria.

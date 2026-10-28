@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 from urllib.parse import parse_qs, urljoin, urlparse
 
 import httpx
@@ -10,8 +11,10 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field, HttpUrl
 
 SCJ_SEARCH_URL = "https://consultasentenciascj.poderjudicial.gob.do/Home/GetExpedientes"
+SCJ_ARCHIVE_SEARCH_URL = "https://poderjudicial.gob.do/"
 MAX_SCJ_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_SCJ_YEAR_SPAN = 10
+MAX_SCJ_ARCHIVE_ARTICLES = 12
 
 
 class FoundationExtractionRequest(BaseModel):
@@ -25,7 +28,10 @@ class FoundationExtractionRequest(BaseModel):
 def _read_options(soup: BeautifulSoup, select_id: str) -> dict[str, str]:
     select = soup.find("select", id=select_id)
     if select is None:
-        raise HTTPException(502, f"El portal SCJ no publicó el filtro esperado: {select_id}.")
+        raise HTTPException(
+            502,
+            f"El portal SCJ no publicó el filtro esperado: {select_id}.",
+        )
     options = {}
     for option in select.find_all("option"):
         value = (option.get("value") or "").strip()
@@ -53,6 +59,30 @@ def _option_value(options: dict[str, str], label: str | None, field: str) -> str
     return value
 
 
+def _scj_error(
+    query: str,
+    portal_url: str,
+    status: str,
+    message: str,
+    *,
+    search_executed: bool = False,
+    error_type: str | None = None,
+    http_status: int | None = None,
+) -> HTTPException:
+    detail = {
+        "query": query,
+        "official_portal": portal_url,
+        "search_executed": search_executed,
+        "status": status,
+        "message": message,
+    }
+    if error_type:
+        detail["error_type"] = error_type
+    if http_status is not None:
+        detail["http_status"] = http_status
+    return HTTPException(502, detail=detail)
+
+
 def _official_document_url(value: object, allowed_host) -> str | None:
     if not isinstance(value, str) or not value.strip():
         return None
@@ -73,8 +103,10 @@ def _scj_candidates(payload: object, allowed_host) -> tuple[list[dict], int] | N
     if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
         return None
     try:
-        count = int(payload.get("recordsFiltered", len(payload["data"])))
-    except (TypeError, ValueError):
+        count = int(payload["recordsFiltered"])
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if count < 0:
         return None
 
     results = []
@@ -83,29 +115,273 @@ def _scj_candidates(payload: object, allowed_host) -> tuple[list[dict], int] | N
         if not isinstance(row, dict):
             continue
         number = row.get("noSentencia")
-        number = number.strip() if isinstance(number, str) else None
+        number = number.strip() if isinstance(number, str) and number.strip() else None
         case_number = row.get("noUnico")
-        case_number = case_number.strip() if isinstance(case_number, str) else None
+        case_number = case_number.strip() if isinstance(case_number, str) and case_number.strip() else None
         document_url = _official_document_url(row.get("urlBlob"), allowed_host)
+        if not number and not document_url:
+            continue
         key = (number, case_number, document_url)
         if key in seen:
             continue
         seen.add(key)
-        results.append({
+        candidate = {
             "status": "CANDIDATE",
             "court": "SCJ",
-            "tribunal": row.get("descTribunal"),
-            "decision_number": number or None,
-            "case_number": case_number or None,
-            "date": row.get("fechaFallo"),
-            "source_url": document_url,
             "source_status": "NOT_VERIFIED",
             "identity_status": "NOT_VERIFIED",
             "passage_status": "NOT_VERIFIED",
             "official_document_verified": False,
             "ratio_decidendi_verified": False,
+        }
+        source_fields = {
+            "tribunal": row.get("descTribunal"),
+            "decision_number": number,
+            "case_number": case_number,
+            "date": row.get("fechaFallo"),
+            "source_url": document_url,
+        }
+        candidate.update({
+            field: value.strip()
+            for field, value in source_fields.items()
+            if isinstance(value, str) and value.strip()
         })
+        results.append(candidate)
     return results, count
+
+
+def _scj_archive_candidates(
+    article_html: str,
+    article_url: str,
+    article_title: str,
+    allowed_host,
+) -> list[dict]:
+    from app import extract_source_date
+
+    soup = BeautifulSoup(article_html, "html.parser")
+    content = soup.select_one(
+        ".elementor-widget-theme-post-content, .entry-content"
+    )
+    if content is None:
+        content = soup.find("article")
+    if content is None:
+        return []
+
+    text = " ".join(content.get_text(" ", strip=True).split())
+    identifier_pattern = re.compile(
+        r"\bSCJ\s*-\s*[A-Z]{2}\s*-\s*(?:\d{2}|\d{4})\s*-\s*\d{3,5}\b",
+        re.I,
+    )
+    identifiers = {
+        re.sub(r"\s+", "", match.group(0)).upper()
+        for match in identifier_pattern.finditer(text)
+    }
+    if len(identifiers) != 1:
+        return []
+    decision_number = identifiers.pop()
+
+    pdf_links = []
+    for anchor in content.find_all("a", href=True):
+        source_url = urljoin(article_url, anchor["href"].strip())
+        parsed = urlparse(source_url)
+        if (
+            parsed.scheme != "https"
+            or not allowed_host(parsed.hostname)
+            or not parsed.path.lower().endswith(".pdf")
+        ):
+            continue
+        parent_text = " ".join(anchor.parent.get_text(" ", strip=True).split())
+        pdf_links.append((source_url, parent_text))
+
+    matching_links = [
+        link for link in pdf_links
+        if decision_number.replace("-", "").casefold()
+        in urlparse(link[0]).path.replace("-", "").casefold()
+    ]
+    if len(matching_links) == 1:
+        source_url = matching_links[0][0]
+    else:
+        explicit_judgment_links = [
+            link for link in pdf_links
+            if re.search(r"\b(?:sentencia|fallo|decisi[oó]n)\b", link[1], re.I)
+        ]
+        if len(explicit_judgment_links) != 1:
+            return []
+        source_url = explicit_judgment_links[0][0]
+
+    tribunal_match = re.search(
+        r"\b(Primera|Segunda|Tercera)\s+Sala\s+de\s+la\s+Suprema\s+Corte\s+de\s+Justicia\b",
+        text,
+        re.I,
+    )
+    candidate = {
+        "status": "CANDIDATE",
+        "court": "SCJ",
+        "decision_number": decision_number,
+        "source_url": source_url,
+        "discovery_url": article_url,
+        "discovery_title": article_title,
+        "search_source": "OFFICIAL_JUDICIARY_SITE",
+        "source_status": "NOT_VERIFIED",
+        "identity_status": "NOT_VERIFIED",
+        "passage_status": "NOT_VERIFIED",
+        "official_document_verified": False,
+        "ratio_decidendi_verified": False,
+    }
+    if tribunal_match:
+        candidate["tribunal"] = " ".join(tribunal_match.group(0).split())
+    decision_date = extract_source_date(text, require_issuance_marker=True)
+    if decision_date:
+        candidate["date"] = decision_date
+    return [candidate]
+
+
+async def _search_scj_official_archive(
+    query: str,
+    allowed_host,
+    validate_official_url,
+) -> dict:
+    search_url = SCJ_ARCHIVE_SEARCH_URL
+    validate_official_url(search_url)
+    article_urls: list[tuple[str, str, str]] = []
+    article_failures = 0
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(20, connect=8),
+            follow_redirects=True,
+            max_redirects=3,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (X11; Linux x86_64) "
+                    "AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36"
+                ),
+                "Accept": "text/html,application/xhtml+xml",
+            },
+            trust_env=False,
+        ) as client:
+            response = await client.get(search_url, params={"s": query})
+            response.raise_for_status()
+            if not allowed_host(response.url.host):
+                return {
+                    "status": "ACCESS_FAILED",
+                    "search_url": str(response.url),
+                    "results": [],
+                    "message": "La búsqueda oficial redirigió fuera del dominio judicial permitido.",
+                }
+            if "html" not in response.headers.get("content-type", "").lower():
+                return {
+                    "status": "EXTRACTION_FAILED",
+                    "search_url": str(response.url),
+                    "results": [],
+                    "message": "El buscador institucional no devolvió HTML interpretable.",
+                }
+
+            listing = BeautifulSoup(response.text, "html.parser")
+            for article in listing.find_all("article"):
+                heading = article.find(["h1", "h2", "h3", "h4"])
+                anchor = (
+                    heading.find("a", href=True)
+                    if heading else article.find("a", href=True)
+                )
+                if anchor is None:
+                    continue
+                article_url = urljoin(str(response.url), anchor["href"].strip())
+                parsed = urlparse(article_url)
+                if (
+                    parsed.scheme != "https"
+                    or not allowed_host(parsed.hostname)
+                    or parsed.path.lower().endswith(".pdf")
+                ):
+                    continue
+                title = " ".join(anchor.get_text(" ", strip=True).split())
+                post_id = next(
+                    (
+                        match.group(1)
+                        for class_name in article.get("class", [])
+                        if (match := re.fullmatch(r"post-(\d+)", class_name))
+                    ),
+                    None,
+                )
+                fetch_url = (
+                    f"{search_url}?p={post_id}" if post_id else article_url
+                )
+                article_urls.append((article_url, fetch_url, title))
+                if len(article_urls) >= MAX_SCJ_ARCHIVE_ARTICLES:
+                    break
+
+            results = []
+            for article_url, fetch_url, title in article_urls:
+                try:
+                    article_response = await client.get(fetch_url)
+                    article_response.raise_for_status()
+                except httpx.HTTPError:
+                    article_failures += 1
+                    continue
+                if (
+                    not allowed_host(article_response.url.host)
+                    or "html" not in article_response.headers.get(
+                        "content-type", ""
+                    ).lower()
+                ):
+                    article_failures += 1
+                    continue
+                results.extend(_scj_archive_candidates(
+                    article_response.text,
+                    article_url,
+                    title,
+                    allowed_host,
+                ))
+    except httpx.HTTPError as exc:
+        return {
+            "status": "ACCESS_FAILED",
+            "search_url": search_url,
+            "results": [],
+            "error_type": type(exc).__name__,
+            "http_status": exc.response.status_code
+            if isinstance(exc, httpx.HTTPStatusError) else None,
+            "message": "No fue posible consultar el buscador institucional del Poder Judicial.",
+        }
+
+    if results:
+        return {
+            "status": "CANDIDATES_FOUND",
+            "search_url": search_url,
+            "results": results,
+            "message": (
+                "El buscador institucional enlazó candidatos PDF. Verifique el "
+                "PDF oficial antes de confirmar identidad o contenido."
+            ),
+        }
+    if article_failures:
+        return {
+            "status": "ACCESS_FAILED",
+            "search_url": search_url,
+            "results": [],
+            "article_failures": article_failures,
+            "message": "No fue posible leer todas las páginas institucionales candidatas.",
+        }
+    listing_text = " ".join(listing.get_text(" ", strip=True).split())
+    if re.search(
+        r"\b(?:no se encontraron resultados|no se han encontrado resultados|no results found)\b",
+        listing_text,
+        re.I,
+    ):
+        return {
+            "status": "NO_RESULTS_CONFIRMED",
+            "search_url": search_url,
+            "results": [],
+            "message": "El archivo institucional confirmó cero resultados para esta consulta.",
+        }
+    return {
+        "status": "EXTRACTION_FAILED",
+        "search_url": search_url,
+        "results": [],
+        "message": (
+            "La página del archivo no permitió confirmar resultados ni un estado "
+            "explícito de cero coincidencias."
+        ),
+    }
 
 
 def _foundation_payload(req, doc: dict, extracted: dict | None) -> dict:
@@ -243,10 +519,11 @@ async def search_scj_candidates(
     limit: int = 10,
 ) -> dict:
     """Query the SCJ's public DataTables endpoint; every returned row is a candidate."""
-    from app import SCJ_PORTAL_URL, allowed_host, validate_official_url
+    from app import SCJ_PORTAL_URL, allowed_host, normalize_space, validate_official_url
 
-    if not q.strip():
-        raise HTTPException(422, "q no puede estar vacío.")
+    normalized_query = normalize_space(q)
+    if len(normalized_query) < 2:
+        raise HTTPException(422, "q debe contener al menos dos caracteres no blancos.")
     if year_from is not None and year_to is not None and year_from > year_to:
         raise HTTPException(400, "year_from no puede ser mayor que year_to.")
     if (year_from is None) != (year_to is None):
@@ -263,8 +540,20 @@ async def search_scj_candidates(
     portal_url = SCJ_PORTAL_URL.rstrip("/") + "/"
     validate_official_url(portal_url)
     validate_official_url(SCJ_SEARCH_URL)
+    response_data = {
+        "query": normalized_query,
+        "official_portal": portal_url,
+        "search_executed": False,
+        "filters": {
+            "chamber": chamber,
+            "matter": matter,
+            "year_from": year_from,
+            "year_to": year_to,
+        },
+    }
     results: list[dict] = []
     reported_count = 0
+    unparsed_results = False
     page_length = max(10, min(limit, 50))
 
     try:
@@ -279,23 +568,41 @@ async def search_scj_candidates(
         ) as client:
             async with client.stream("GET", portal_url) as response:
                 if 300 <= response.status_code < 400:
-                    raise HTTPException(502, "El portal SCJ redirigió la consulta inicial.")
+                    raise _scj_error(
+                        normalized_query, portal_url, "ACCESS_FAILED",
+                        "El portal SCJ redirigió la consulta inicial.",
+                        http_status=response.status_code,
+                    )
                 response.raise_for_status()
                 content_type = response.headers.get("content-type", "").lower()
                 if "html" not in content_type:
-                    raise HTTPException(502, "El portal SCJ no devolvió su formulario de búsqueda.")
+                    raise _scj_error(
+                        normalized_query, portal_url, "EXTRACTION_FAILED",
+                        "El portal SCJ no devolvió su formulario de búsqueda HTML.",
+                    )
                 chunks = []
                 size = 0
                 async for chunk in response.aiter_bytes():
                     size += len(chunk)
                     if size > MAX_SCJ_RESPONSE_BYTES:
-                        raise HTTPException(502, "El formulario oficial SCJ supera el límite de lectura.")
+                        raise _scj_error(
+                            normalized_query, portal_url, "EXTRACTION_FAILED",
+                            "El formulario oficial SCJ supera el límite de lectura.",
+                        )
                     chunks.append(chunk)
                 soup = BeautifulSoup(b"".join(chunks), "html.parser")
 
-            tribunal_options = _read_options(soup, "cbSala")
-            matter_options = _read_options(soup, "cbMateria")
-            year_options = _read_options(soup, "cbAno")
+            try:
+                tribunal_options = _read_options(soup, "cbSala")
+                matter_options = _read_options(soup, "cbMateria")
+                year_options = _read_options(soup, "cbAno")
+            except HTTPException as exc:
+                if exc.status_code != 502:
+                    raise
+                raise _scj_error(
+                    normalized_query, portal_url, "EXTRACTION_FAILED",
+                    str(exc.detail),
+                ) from exc
             tribunal_id = _option_value(tribunal_options, chamber, "chamber")
             matter_id = _option_value(matter_options, matter, "matter")
 
@@ -312,7 +619,7 @@ async def search_scj_candidates(
                     "Ano": year_id,
                     "Mes": "",
                     "IdTipoDocumento": "1",
-                    "Contenido": q.strip(),
+                    "Contenido": normalized_query,
                 }
                 async with client.stream(
                     "POST",
@@ -326,34 +633,43 @@ async def search_scj_candidates(
                     },
                 ) as response:
                     if 300 <= response.status_code < 400:
-                        raise HTTPException(502, "La búsqueda oficial SCJ redirigió la consulta.")
+                        raise _scj_error(
+                            normalized_query, portal_url, "ACCESS_FAILED",
+                            "La búsqueda oficial SCJ redirigió la consulta.",
+                            http_status=response.status_code,
+                        )
                     response.raise_for_status()
                     body = bytearray()
                     async for chunk in response.aiter_bytes():
                         body.extend(chunk)
                         if len(body) > MAX_SCJ_RESPONSE_BYTES:
-                            raise HTTPException(502, "La respuesta oficial SCJ supera el límite de lectura.")
+                            raise _scj_error(
+                                normalized_query, portal_url, "EXTRACTION_FAILED",
+                                "La respuesta oficial SCJ supera el límite de lectura.",
+                                search_executed=True,
+                            )
+                response_data["search_executed"] = True
                 try:
                     payload = json.loads(body)
                 except (json.JSONDecodeError, UnicodeDecodeError):
                     return {
-                        "query": q,
-                        "official_portal": portal_url,
-                        "status": "EXTRACTION_UNVERIFIED",
+                        **response_data,
+                        "status": "EXTRACTION_FAILED",
                         "results": [],
                         "message": "La respuesta del portal SCJ no contiene JSON interpretable.",
                     }
                 parsed = _scj_candidates(payload, allowed_host)
                 if parsed is None:
                     return {
-                        "query": q,
-                        "official_portal": portal_url,
-                        "status": "EXTRACTION_UNVERIFIED",
+                        **response_data,
+                        "status": "EXTRACTION_FAILED",
                         "results": [],
                         "message": "La respuesta SCJ no coincide con el esquema publicado de resultados.",
                     }
                 candidates, count = parsed
                 reported_count += count
+                if not candidates and (count > 0 or payload["data"]):
+                    unparsed_results = True
                 for candidate in candidates:
                     if candidate not in results:
                         results.append(candidate)
@@ -364,26 +680,90 @@ async def search_scj_candidates(
     except HTTPException:
         raise
     except httpx.HTTPError as exc:
-        raise HTTPException(
-            502, f"No fue posible consultar el buscador oficial SCJ ({type(exc).__name__})."
+        raise _scj_error(
+            normalized_query,
+            portal_url,
+            "ACCESS_FAILED",
+            "No fue posible consultar el buscador oficial SCJ.",
+            search_executed=response_data["search_executed"],
+            error_type=type(exc).__name__,
+            http_status=exc.response.status_code
+            if isinstance(exc, httpx.HTTPStatusError) else None,
         ) from exc
 
+    if results:
+        status = "CANDIDATES_FOUND"
+        message = (
+            "Coincidencias localizadas; verifique cada documento oficial antes "
+            "de atribuir criterios."
+        )
+    elif unparsed_results or reported_count:
+        status = "EXTRACTION_FAILED"
+        message = (
+            "El portal informó registros, pero no se pudieron extraer candidatos "
+            "con el esquema esperado."
+        )
+    else:
+        archive = None
+        if not any((chamber, matter, year_from, year_to)):
+            archive = await _search_scj_official_archive(
+                normalized_query, allowed_host, validate_official_url
+            )
+            response_data["search_executed"] = True
+            response_data["archive_search"] = {
+                "status": archive["status"],
+                "search_url": archive["search_url"],
+            }
+            if archive["status"] == "CANDIDATES_FOUND":
+                return {
+                    **response_data,
+                    "official_results_reported": reported_count,
+                    "status": "CANDIDATES_FOUND",
+                    "results": archive["results"][:limit],
+                    "message": archive["message"],
+                    "note": (
+                        "El buscador principal no devolvió registros. Los enlaces "
+                        "del sitio institucional son candidatos; verifique el PDF "
+                        "oficial antes de confirmar identidad o contenido."
+                    ),
+                }
+            archive_status = archive.get("status")
+            if archive_status in {
+                "NO_RESULTS_CONFIRMED",
+                "ACCESS_FAILED",
+                "EXTRACTION_FAILED",
+            }:
+                status = archive_status
+                message = archive.get(
+                    "message",
+                    "La búsqueda alternativa no pudo confirmar resultados.",
+                )
+            else:
+                status = "EXTRACTION_FAILED"
+                message = (
+                    "La búsqueda principal informó cero registros, pero la "
+                    "respuesta del archivo alternativo no permitió clasificar "
+                    "el resultado."
+                )
+        else:
+            status = "NO_RESULTS_CONFIRMED"
+            message = (
+                "El portal SCJ informó cero registros para esta consulta y filtros; "
+                "el buscador institucional alternativo no se ejecutó porque no "
+                "admite esos filtros."
+            )
+
     return {
-        "query": q,
-        "official_portal": portal_url,
-        "filters": {
-            "chamber": chamber,
-            "matter": matter,
-            "year_from": year_from,
-            "year_to": year_to,
-        },
+        **response_data,
         "official_results_reported": reported_count,
-        "status": "CANDIDATES_FOUND" if results else "NO_CANDIDATES_IN_RESPONSE",
+        "status": status,
         "results": results[:limit],
+        "message": message,
         "note": (
             "Los registros son candidatos devueltos por la búsqueda oficial. "
-            "La ausencia de registros en esta respuesta no prueba que no existan sentencias; "
-            "verifique cada PDF, tribunal, número y pasaje antes de atribuir criterios."
+            "La ausencia de registros en esta respuesta no prueba que no existan "
+            "sentencias; verifique cada PDF, tribunal, número y pasaje antes de "
+            "atribuir criterios."
         ),
     }
 
