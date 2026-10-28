@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, HttpUrl, Field
 from pypdf import PdfReader
 
-APP_VERSION = "1.6.2"
+APP_VERSION = "1.6.3.1"
 MAX_DOCUMENT_BYTES = 12 * 1024 * 1024
 MAX_PDF_PAGES = 350
 MAX_REDIRECTS = 3
@@ -75,6 +75,72 @@ def allowed_host(host: str | None) -> bool:
     host = host.lower().strip(".")
     return any(host == s or host.endswith("." + s) for s in ALLOWED_HOST_SUFFIXES)
 
+def _institutional_headers(text: str) -> list[tuple[str, int, int]]:
+    headers = []
+    for match in re.finditer(r"[^\n]*", (text or "")[:900]):
+        line = fold(match.group(0)).strip(" .:\t")
+        if re.match(r"^(?:la\s+)?(?:primera|segunda|tercera)\s+sala\s+de\s+la\s+suprema corte de justicia\b", line):
+            headers.append(("SCJ", match.start(), match.end()))
+        elif re.fullmatch(r"(?:republica dominicana\s+)?tribunal constitucional(?:\s+de la republica dominicana)?", line):
+            headers.append(("TC", match.start(), match.end()))
+        elif re.fullmatch(r"(?:republica dominicana\s+)?suprema corte de justicia(?:\s+de la republica dominicana)?", line):
+            headers.append(("SCJ", match.start(), match.end()))
+    return headers
+
+def _primary_identifier(text: str) -> tuple[str, str] | None:
+    opening = (text or "")[:4500]
+    patterns = (
+        ("TC", re.compile(r"\bTC/\d{3,4}/\d{2}\b", re.I)),
+        ("SCJ", re.compile(r"\bSCJ-[A-Z]{2}-\d{2}-\d{3,5}\b", re.I)),
+    )
+    candidates = sorted(
+        (match.start(), match.end(), court, match.group(0).upper())
+        for court, pattern in patterns for match in pattern.finditer(opening)
+    )
+    historical = re.search(
+        r"(?im)^\s*SENTENCIA\s+DEL\s+[^\n]{1,140}?N[ÚU]M\.?\s*(\d{1,5})\s*$",
+        opening[:700],
+    )
+    if historical:
+        candidates.append((historical.start(), historical.end(), "SCJ",
+                           f"NÚM. {int(historical.group(1))}"))
+        candidates.sort()
+    headers = _institutional_headers(opening)
+    if len({header[0] for header in headers}) > 1:
+        return None
+    if headers:
+        header_court, header_start, header_end = headers[0]
+        historical_titles = [item for item in candidates
+                             if item[2] == "SCJ" and item[3].startswith("NÚM. ")
+                             and 0 <= header_start - item[0] <= 700]
+        if header_court == "SCJ" and historical_titles:
+            return min(historical_titles, key=lambda item: item[0])[2:4]
+        nearby = [item for item in candidates
+                  if header_start - 120 <= item[0] <= header_end + 1200]
+        aligned = [item for item in nearby if item[2] == header_court]
+        if aligned:
+            labeled = [item for item in aligned
+                       if re.match(r"\s*(?:sentencia|decision|decisi[oó]n)\b",
+                                   opening[opening.rfind("\n", 0, item[0]) + 1:item[0]], re.I)]
+            if labeled:
+                return min(labeled, key=lambda item: item[0])[2:4]
+            return min(aligned, key=lambda item: abs(item[0] - header_end))[2:4]
+        if nearby:
+            return min(nearby, key=lambda item: abs(item[0] - header_end))[2:4]
+        return None
+    if not candidates or candidates[0][0] > 350:
+        return None
+    first = candidates[0]
+    labeled = [item for item in candidates
+               if re.match(r"\s*(?:sentencia|decision|decisi[oó]n)\b",
+                           opening[opening.rfind("\n", 0, item[0]) + 1:item[0]], re.I)]
+    if labeled:
+        return min(labeled, key=lambda item: item[0])[2:4]
+    context = fold(opening[max(0, first[0] - 50):first[0]])
+    if first[0] > 80 and not re.search(r"\b(?:sentencia|decision|decisi[oó]n)\b", context):
+        return None
+    return first[2:4]
+
 def tokenize(v: str | None) -> set[str]:
     stop = {"de","la","el","los","las","un","una","y","o","a","en","por","para","con","del","que","se","su","sus","al","como","es","son","ha","han","ser","fue","esta","este","sobre","entre","cuando","sin","si","no","lo","le","les","más","mas"}
     return {t for t in re.findall(r"[a-z0-9]{3,}", fold(v)) if t not in {fold(w) for w in stop}}
@@ -84,27 +150,25 @@ def overlap_ratio(a: str, b: str) -> float:
     return len(ta & tb) / max(len(ta), 1) if ta else 0.0
 
 def detect_court(host: str | None, expected: str | None = None, text: str | None = None):
-    """Use decision-header evidence; referenced courts in background do not govern."""
-    opening = (text or "")[:2200]
-    tc_number = re.search(r"\b(?:SENTENCIA\s+)?TC/\d{3,4}/\d{2}\b", opening, re.I)
-    scj_number = re.search(r"\bSCJ-[A-Z]{2}-\d{2}-\d{3,5}\b", opening, re.I)
-    if tc_number and not scj_number: return "TC"
-    if scj_number and not tc_number: return "SCJ"
-    if tc_number and scj_number: return None
-    top = fold(opening[:500])
-    if "tribunal constitucional" in top and "suprema corte de justicia" not in top: return "TC"
-    if "suprema corte de justicia" in top and "tribunal constitucional" not in top: return "SCJ"
-    return None
+    """Identify the issuing court from its formal heading and principal identifier."""
+    headers = _institutional_headers(text or "")
+    if len({header[0] for header in headers}) > 1:
+        return None
+    identifier = _primary_identifier(text or "")
+    if headers:
+        header_court = headers[0][0]
+        if identifier and identifier[0] != header_court:
+            return None
+        return header_court
+    return identifier[0] if identifier else None
 
 
 def primary_decision_number(text: str, court: str | None):
-    """Find the decision number in the opening; do not search cited precedents."""
-    opening = (text or "")[:4500]
-    pattern = (r"\bSCJ-[A-Z]{2}-\d{2}-\d{3,5}\b" if court == "SCJ"
-               else r"\bTC/\d{3,4}/\d{2}\b" if court == "TC" else None)
-    if not pattern: return None
-    match = re.search(pattern, opening, re.I)
-    return match.group(0).upper() if match else None
+    """Find the principal identifier anchored to its formal heading or title."""
+    if court not in ("TC", "SCJ"):
+        return None
+    identifier = _primary_identifier(text)
+    return identifier[1] if identifier and identifier[0] == court else None
 
 
 def decision_number_matches(text: str, court: str | None, expected: str | None):
@@ -199,6 +263,9 @@ PARTY_INTRO = re.compile(
     r"(?:la parte recurrente|la parte recurrida|el recurrente|la recurrente|"
     r"la demandante|la demandada|la apelante|el apelante)\s+"
     r"(?:alega|sostiene|afirma|argumenta|aduce|expone|invoca|señala)", re.I)
+SCJ_PARTY_ASSERTION = re.compile(
+    r"^(?:\d+[).]\s*)?que\s+(?:la parte (?:recurrente|recurrida) no ha establecido|"
+    r"la alzada fundament[oó])\b", re.I)
 QUOTED_LOWER_COURT = re.compile(
     r"(?:finalmente\s+concluye\s+la\s+corte\s+motivando\s+lo\s+siguiente)|"
     r"(?:la corte|el tribunal|la alzada)\s+(?:motiv[oó]|expres[oó]|estableci[oó]|"
@@ -475,6 +542,7 @@ def extract_numbered_foundations(pages: list[dict], court: str | None = None) ->
 def annotate_foundation_attribution(units: list[dict], court: str | None = None) -> list[dict]:
     """Track nested quotations and party submissions; prefer uncertainty to false attribution."""
     quoted=False
+    party_response_open=False
     for u in units:
         txt=u["text"]
         if u.get("section")!="DECIDING_COURT":
@@ -515,6 +583,17 @@ def annotate_foundation_attribution(units: list[dict], court: str | None = None)
         if quoted:
             u["attribution"]="LOWER_COURT_QUOTATION_REVIEW";u["attribution_indicators"]=["within_lower_court_quotation_scope"];continue
         attr, indicators=attribution_context(txt)
+        if court == "SCJ" and SCJ_PARTY_ASSERTION.match(txt):
+            attr = "PARTY_ARGUMENT_OR_MIXED_REVIEW"
+            indicators = ["numbered_scj_party_response"]
+            party_response_open = True
+        elif court == "SCJ" and party_response_open and re.match(r"^\d+[).]\s*que\b", txt, re.I):
+            attr = "PARTY_ARGUMENT_OR_MIXED_REVIEW"
+            indicators = ["continuation_of_scj_party_response", "mixed_unit_requires_review"]
+            if re.search(r"\besta (?:primera sala|sala|suprema corte|corte de casaci[oó]n)\b", txt, re.I):
+                party_response_open = False
+        elif court == "SCJ":
+            party_response_open = False
         if attr=="UNDETERMINED_REQUIRES_CONTEXT":
             attr="DECIDING_COURT_SECTION_REVIEW";indicators=["scj_deliberation_section","requires_individual_review"]
         u["attribution"]=attr;u["attribution_indicators"]=indicators
