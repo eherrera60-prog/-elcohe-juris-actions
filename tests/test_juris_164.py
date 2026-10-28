@@ -61,6 +61,13 @@ class FoundationExtractionTests(unittest.TestCase):
             with extractor:
                 return self.client.post("/v1/extract-foundations", json=self.payload)
 
+    def assert_evidence_is_not_a_verified_criterion(self, result):
+        self.assertEqual(result["evidence_type"], "EXTRACTED_SOURCE_TEXT")
+        self.assertEqual(result["citation_classification"], "NOT_PERFORMED")
+        self.assertIsNone(result["interpretation"])
+        self.assertEqual(result["criterion_status"], "NOT_VERIFIED")
+        self.assertIsNone(result["verified_criterion"])
+
     def test_verified_pdf_returns_page_anchored_passage_without_certifying_holding(self):
         response = self.post_extraction()
         self.assertEqual(response.status_code, 200)
@@ -69,14 +76,61 @@ class FoundationExtractionTests(unittest.TestCase):
         self.assertEqual(result["identity_status"], "VERIFIED_IDENTITY")
         self.assertEqual(result["passage_status"], "VERIFIED_PASSAGE")
         self.assertEqual(result["status"], "VERIFIED_PASSAGE")
+        self.assert_evidence_is_not_a_verified_criterion(result)
         self.assertEqual(result["legal_holding_status"], "CANDIDATE")
         passage = result["foundations"][0]
+        self.assert_evidence_is_not_a_verified_criterion(passage)
         self.assertEqual(passage["decision_number"], "SCJ-TS-24-00123")
         self.assertEqual(passage["tribunal"], "Primera Sala")
         self.assertEqual(passage["date"], "4 de marzo de 2024")
         self.assertEqual(passage["page"], 1)
         self.assertIn("Esta Suprema Corte establece", passage["passage"])
         self.assertFalse(passage["ratio_decidendi_verified"])
+
+    def test_analyze_decision_distinguishes_extracted_text_from_criterion(self):
+        with patch("app.fetch_document", new=AsyncMock(return_value=official_pdf())), \
+             patch("app.extract_document_text", return_value=document()):
+            response = self.client.post("/v1/analyze-decision", json={
+                **self.payload,
+                "legal_issue": "interpretación jurídica y caso concreto",
+            })
+        self.assertEqual(response.status_code, 200)
+        result = response.json()
+        self.assert_evidence_is_not_a_verified_criterion(result)
+        self.assertTrue(result["relevant_passages"])
+        self.assert_evidence_is_not_a_verified_criterion(result["relevant_passages"][0])
+        self.assertIsNone(result["jurisprudential_card"]["ratio_decidendi"])
+
+    def test_decision_excerpt_is_source_text_not_interpretation(self):
+        with patch("app.fetch_document", new=AsyncMock(return_value=official_pdf())), \
+             patch("app.extract_document_text", return_value=document()):
+            response = self.client.post("/v1/decision-excerpt", json={
+                **self.payload,
+                "page": 1,
+                "query": "Esta Suprema Corte",
+            })
+        self.assertEqual(response.status_code, 200)
+        result = response.json()
+        self.assert_evidence_is_not_a_verified_criterion(result)
+        self.assertTrue(result["query_found"])
+        self.assertFalse(result["ratio_decidendi_verified"])
+
+    def test_promote_holding_keeps_criterion_unverified_without_review(self):
+        with patch("app.fetch_document", new=AsyncMock(return_value=official_pdf())), \
+             patch("app.extract_document_text", return_value=document()):
+            response = self.client.post("/v1/promote-holding", json={
+                **self.payload,
+                "legal_issue": "interpretación jurídica y caso concreto",
+                "legal_proposition": "La interpretación depende del análisis concreto del tribunal.",
+                "support_quote": "Esta cita inventada no aparece en el documento oficial.",
+                "support_page": 1,
+                "judicial_reasoning_reviewed": False,
+            })
+        self.assertEqual(response.status_code, 200)
+        result = response.json()
+        self.assertEqual(result["status"], "HOLDING_NOT_PROMOTED")
+        self.assert_evidence_is_not_a_verified_criterion(result)
+        self.assertIsNone(result["legal_proposition"])
 
     def test_cited_tc_number_does_not_replace_scj_identity(self):
         response = self.post_extraction()

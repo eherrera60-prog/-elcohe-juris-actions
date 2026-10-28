@@ -176,6 +176,15 @@ def decision_number_matches(text: str, court: str | None, expected: str | None):
     if not expected: return identified is not None
     return identified is not None and fold(identified) == fold(expected)
 
+def evidence_classification_fields() -> dict[str, Any]:
+    return {
+        "evidence_type": "EXTRACTED_SOURCE_TEXT",
+        "citation_classification": "NOT_PERFORMED",
+        "interpretation": None,
+        "criterion_status": "NOT_VERIFIED",
+        "verified_criterion": None,
+    }
+
 def court_matches(detected: str | None, expected: str | None) -> bool:
     if not expected:
         return detected in ("SCJ", "TC")
@@ -840,8 +849,9 @@ async def analyze_official_decision(req:AnalyzeDecisionRequest):
     passages=find_relevant_passages(ex["pages"],req.legal_issue,req.max_passages,court)
     for passage in passages:
         passage.update(context_for_page(ex["pages"],passage["page"]))
+        passage.update(evidence_classification_fields())
     status="HOLDING_CANDIDATE" if ex["extraction_ok"] and court_ok and expected_match and passages else ("VERIFIED_SOURCE" if ex["extraction_ok"] and court_ok and expected_match else "NOT_VERIFIED")
-    return {"status":status,"official_source_verified":bool(ex["extraction_ok"] and court_ok and expected_match),"expected_court_match":court_ok,"expected_number_match":expected_match,"metadata":meta,"relevant_passages":passages,"extraction_diagnostics":{"numbered_foundations_detected":len(all_foundations),"foundation_numbers_detected":[u["foundation_number"] for u in all_foundations[:100]],"candidate_passages_returned":len(passages),"selection_limit":req.max_passages,"note":"La ausencia de un fundamento en candidatos no prueba su inexistencia en el PDF."},"jurisprudential_card":{"tribunal":court,"sala":meta.get("chamber"),"sentencia":meta.get("decision_number"),"fecha":meta.get("date"),"expediente":meta.get("case_number"),"estado_verificacion":status,"cuestion_juridica":req.legal_issue,"fundamentos_candidatos":passages,"ratio_decidendi":None,"regla_juridica":None,"review_required":True,"fuente_oficial":doc["final_url"],"paginas":ex["page_count"]},"source_url":doc["final_url"],"sha256":doc["sha256"]}
+    return {"status":status,"official_source_verified":bool(ex["extraction_ok"] and court_ok and expected_match),**evidence_classification_fields(),"expected_court_match":court_ok,"expected_number_match":expected_match,"metadata":meta,"relevant_passages":passages,"extraction_diagnostics":{"numbered_foundations_detected":len(all_foundations),"foundation_numbers_detected":[u["foundation_number"] for u in all_foundations[:100]],"candidate_passages_returned":len(passages),"selection_limit":req.max_passages,"note":"La ausencia de un fundamento en candidatos no prueba su inexistencia en el PDF."},"jurisprudential_card":{"tribunal":court,"sala":meta.get("chamber"),"sentencia":meta.get("decision_number"),"fecha":meta.get("date"),"expediente":meta.get("case_number"),"estado_verificacion":status,"cuestion_juridica":req.legal_issue,"fundamentos_candidatos":passages,"ratio_decidendi":None,"regla_juridica":None,"review_required":True,"fuente_oficial":doc["final_url"],"paginas":ex["page_count"]},"source_url":doc["final_url"],"sha256":doc["sha256"]}
 
 @app.post("/v1/decision-excerpt", operation_id="readOfficialDecisionExcerpt")
 async def read_official_decision_excerpt(req: DecisionExcerptRequest):
@@ -879,6 +889,7 @@ async def read_official_decision_excerpt(req: DecisionExcerptRequest):
     end = min(len(searchable), start + req.max_chars)
     return {
         "status": "EXTRACTED_TEXT_REQUIRES_LEGAL_REVIEW",
+        **evidence_classification_fields(),
         "metadata": extract_metadata_from_text(ex["full_text"], court),
         "page": req.page,
         "page_count": ex["page_count"],
@@ -959,7 +970,7 @@ async def promote_verified_holding(req:HoldingPromotionRequest):
     ok=official and court_ok and req.judicial_reasoning_reviewed and number_ok and page_ok and support_exact and support_located and attribution == "POSSIBLE_JUDICIAL_REASONING_REVIEW" and reviewer_ok and issue_score>=0.15 and prop_score>=0.18 and outcome_ok
     if not official: reasons.append("Documento oficial no confirmado o extracción insuficiente.")
     if ok: reasons.append("Los controles heurísticos no acreditan por sí solos la ratio decidendi; no se emite certificación automática.")
-    return {"status":"HOLDING_REQUIRES_INDEPENDENT_LEGAL_REVIEW" if ok else "HOLDING_NOT_PROMOTED","court":court,"metadata":meta,"legal_issue":req.legal_issue,"legal_proposition":None,"support":{"page":req.support_page,"quote":req.support_quote if support_exact else None,"outcome_page":req.outcome_page,"outcome_quote":req.outcome_quote if outcome_ok else None},"gates":gates,"reasons":reasons,"verification_note":"La verificación documental y los indicadores de atribución no prueban por sí mismos la ratio decidendi. Requiere juicio jurídico humano y cotejo del dispositivo.","source_url":doc["final_url"],"sha256":doc["sha256"]}
+    return {"status":"HOLDING_REQUIRES_INDEPENDENT_LEGAL_REVIEW" if ok else "HOLDING_NOT_PROMOTED",**evidence_classification_fields(),"court":court,"metadata":meta,"legal_issue":req.legal_issue,"legal_proposition":None,"support":{"page":req.support_page,"quote":req.support_quote if support_exact else None,"outcome_page":req.outcome_page,"outcome_quote":req.outcome_quote if outcome_ok else None},"gates":gates,"reasons":reasons,"verification_note":"La verificación documental y los indicadores de atribución no prueban por sí mismos la ratio decidendi. Requiere juicio jurídico humano y cotejo del dispositivo.","source_url":doc["final_url"],"sha256":doc["sha256"]}
 
 # Registro persistente opcional; sin DATABASE_URL no altera los endpoints existentes.
 from registry import router as registry_router

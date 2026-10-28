@@ -115,6 +115,7 @@ def _foundation_payload(req, doc: dict, extracted: dict | None) -> dict:
         court_matches,
         decision_number_matches,
         detect_court,
+        evidence_classification_fields,
         extract_metadata_from_text,
         extract_numbered_foundations,
         normalize_space,
@@ -128,6 +129,7 @@ def _foundation_payload(req, doc: dict, extracted: dict | None) -> dict:
     source_status = "VERIFIED_SOURCE" if official_pdf else "NOT_VERIFIED"
     base = {
         "status": "NOT_VERIFIED",
+        **evidence_classification_fields(),
         "source_status": source_status,
         "identity_status": "NOT_VERIFIED",
         "passage_status": "NOT_VERIFIED",
@@ -194,6 +196,7 @@ def _foundation_payload(req, doc: dict, extracted: dict | None) -> dict:
         passage = normalize_space(unit["text"])
         passages.append({
             "status": "VERIFIED_PASSAGE",
+            **evidence_classification_fields(),
             "legal_holding_status": "CANDIDATE",
             "court": court,
             "tribunal": metadata.get("chamber") or (
