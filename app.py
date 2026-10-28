@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, HttpUrl, Field
 from pypdf import PdfReader
 
-APP_VERSION = "1.6.3.1"
+APP_VERSION = "1.6.4"
 MAX_DOCUMENT_BYTES = 12 * 1024 * 1024
 MAX_PDF_PAGES = 350
 MAX_REDIRECTS = 3
@@ -663,7 +663,7 @@ async def search_tc(q: str = Query(min_length=2), year: int | None = None,
     # The official TC form filters years separately; appending the year to
     # searchString changes the query and does not activate the year filter.
     search_term = q.strip()
-    params = {"searchString": search_term, "size": 999999 if year else max(limit, 10)}
+    params = {"searchString": search_term, "size": max(limit, 10)}
     if year is not None:
         if year < 2012 or year > 2100:
             raise HTTPException(status_code=422, detail="Año de sentencia fuera del rango permitido.")
@@ -740,6 +740,10 @@ async def search_tc(q: str = Query(min_length=2), year: int | None = None,
         seen.add(key)
         results.append({"court": "TC", "decision_number": decision_number,
                         "source_url": href, "status": "LOCATED_UNVERIFIED",
+                        "verification_status": "CANDIDATE",
+                        "source_status": "NOT_VERIFIED",
+                        "identity_status": "NOT_VERIFIED",
+                        "passage_status": "NOT_VERIFIED",
                         "official_document_verified": False,
                         "ratio_decidendi_verified": False})
         if len(results) >= limit:
@@ -966,3 +970,5 @@ from registry_promotion import router as registry_promotion_router
 app.include_router(registry_promotion_router)
 from juris_163 import install
 install(app)
+from juris_164 import install as install_164
+install_164(app)

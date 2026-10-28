@@ -1,4 +1,4 @@
-"""ELCOHE-JURIS RD 1.6.3: one-request documentary research.
+"""Integrated documentary research retained for API compatibility.
 Install by adding `from juris_163 import install; install(app)` at END of app.py.
 This module uses the existing app.py security, extraction, and attribution helpers.
 """
@@ -22,6 +22,7 @@ def install(app):
     from app import (search_tc, fetch_document, extract_document_text, detect_court,
                      court_matches, decision_number_matches, extract_metadata_from_text,
                      find_relevant_passages, allowed_host, normalize_space)
+    from juris_164 import search_scj_candidates
     from urllib.parse import urlparse
     from bs4 import BeautifulSoup
 
@@ -69,7 +70,11 @@ def install(app):
                             continue
                         seen.add(target)
                         results.append({"court": "TC", "decision_number": canonical,
-                                        "source_url": target, "status": "LOCATED_UNVERIFIED"})
+                                        "source_url": target, "status": "LOCATED_UNVERIFIED",
+                                        "verification_status": "CANDIDATE",
+                                        "source_status": "NOT_VERIFIED",
+                                        "identity_status": "NOT_VERIFIED",
+                                        "passage_status": "NOT_VERIFIED"})
                         if len(results) >= limit:
                             break
                 except Exception as exc:
@@ -167,13 +172,36 @@ def install(app):
         if req.official_pdf_url:
             if not req.expected_number:
                 raise HTTPException(422, "expected_number es obligatorio para verificar un PDF.")
-            return {"version": "1.6.3.1", "mode": "DIRECT_OFFICIAL_PDF",
+            return {"version": "1.6.4", "mode": "DIRECT_OFFICIAL_PDF",
                     "result": await inspect_pdf(str(req.official_pdf_url), req.court,
                                                 req.expected_number, req.legal_issue,
                                                 req.max_passages)}
         if req.court == "SCJ":
-            return {"version": "1.6.3.1", "status": "SCJ_SEARCH_NOT_IMPLEMENTED",
-                    "note": "La función SCJ existente solo prepara consultas. Proporcione official_pdf_url y expected_number; no se inventan resultados."}
+            search = await search_scj_candidates(
+                req.expected_number or req.legal_issue,
+                year_from=req.year,
+                year_to=req.year,
+                limit=req.max_candidates,
+            )
+            if not req.expected_number:
+                return {"version": "1.6.4", "mode": "SCJ_OFFICIAL_SEARCH",
+                        "status": search["status"], "search": search,
+                        "note": "Los resultados SCJ son candidatos. Verifique el PDF, tribunal y número antes de extraer o atribuir fundamentos."}
+            results = []
+            for candidate in search.get("results", [])[:req.max_candidates]:
+                if candidate.get("decision_number") != req.expected_number:
+                    continue
+                url = candidate.get("source_url")
+                if not url:
+                    continue
+                results.append(await inspect_pdf(
+                    url, "SCJ", req.expected_number, req.legal_issue,
+                    req.max_passages
+                ))
+            return {"version": "1.6.4", "mode": "SCJ_SEARCH_AND_VERIFY",
+                    "status": "RESULTS_REQUIRE_LEGAL_REVIEW" if results else search["status"],
+                    "search": search, "results": results,
+                    "legal_analysis_verified": False, "review_required": True}
         search = await search_tc(q=req.expected_number or req.legal_issue,
                                  year=req.year, limit=req.max_candidates)
         if search.get("status") != "LOCATED_RESULTS":
@@ -181,7 +209,7 @@ def install(app):
             if fallback and fallback.get("status") == "LOCATED_RESULTS":
                 search = fallback
             else:
-                return {"version": "1.6.3.1", "status": "SEARCH_UNVERIFIED",
+                return {"version": "1.6.4", "status": "SEARCH_UNVERIFIED",
                         "search": search, "fallback": fallback, "results": [], "review_required": True}
         results = []
         for candidate in search.get("results", [])[:req.max_candidates]:
@@ -216,7 +244,7 @@ def install(app):
             except Exception as exc:
                 results.append({"decision_number": number, "status": "SOURCE_ERROR",
                                 "error_type": type(exc).__name__, "review_required": True})
-        return {"version": "1.6.3.1", "mode": "TC_SEARCH_AND_VERIFY",
+        return {"version": "1.6.4", "mode": "TC_SEARCH_AND_VERIFY",
                 "status": "RESULTS_REQUIRE_LEGAL_REVIEW", "query": req.legal_issue,
                 "results": results, "legal_analysis_verified": False,
                 "review_required": True}
