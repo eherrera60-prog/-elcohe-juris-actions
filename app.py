@@ -15,6 +15,12 @@ MAX_PDF_PAGES = 350
 MAX_REDIRECTS = 3
 TC_SEARCH_URL = "https://www.tribunalconstitucional.gob.do/consultas/secretar%C3%ADa/sentencias/"
 SCJ_PORTAL_URL = "https://consultasentenciascj.poderjudicial.gob.do/"
+SCJ_ID_SEPARATOR = r"(?:[ \t\r\n]{0,12}[-\u00ad\u2010-\u2014\u2212][ \t\r\n]{0,12}|[ \t\r\n]{1,12})"
+SCJ_IDENTIFIER_SOURCE = (
+    rf"(?<!\w)SCJ{SCJ_ID_SEPARATOR}[A-Z]{{2}}{SCJ_ID_SEPARATOR}"
+    rf"(?:\d{{2}}|\d{{4}}){SCJ_ID_SEPARATOR}\d{{3,5}}(?!\w)"
+)
+SCJ_IDENTIFIER_PATTERN = re.compile(SCJ_IDENTIFIER_SOURCE, re.I)
 ALLOWED_HOST_SUFFIXES = (
     "tribunalconstitucional.gob.do",
     "poderjudicial.gob.do",
@@ -70,6 +76,14 @@ def fold(v: str | None) -> str:
     v = normalize_space(v).lower()
     return "".join(ch for ch in unicodedata.normalize("NFD", v) if unicodedata.category(ch) != "Mn")
 
+def canonical_scj_identifier(value: str | None) -> str | None:
+    value = normalize_space(value)
+    value = re.sub(r"^N[ÚU]M\.?\s*", "", value, flags=re.I)
+    match = SCJ_IDENTIFIER_PATTERN.fullmatch(value)
+    if not match:
+        return None
+    return "-".join(re.findall(r"[A-Z]+|\d+", match.group(0).upper()))
+
 def allowed_host(host: str | None) -> bool:
     if not host: return False
     host = host.lower().strip(".")
@@ -91,10 +105,14 @@ def _primary_identifier(text: str) -> tuple[str, str] | None:
     opening = (text or "")[:4500]
     patterns = (
         ("TC", re.compile(r"\bTC/\d{3,4}/\d{2}\b", re.I)),
-        ("SCJ", re.compile(r"\bSCJ-[A-Z]{2}-(?:\d{2}|\d{4})-\d{3,5}\b", re.I)),
+        ("SCJ", SCJ_IDENTIFIER_PATTERN),
     )
     candidates = sorted(
-        (match.start(), match.end(), court, match.group(0).upper())
+        (
+            match.start(), match.end(), court,
+            canonical_scj_identifier(match.group(0))
+            if court == "SCJ" else match.group(0).upper(),
+        )
         for court, pattern in patterns for match in pattern.finditer(opening)
     )
     historical = re.search(
@@ -104,6 +122,17 @@ def _primary_identifier(text: str) -> tuple[str, str] | None:
     if historical:
         candidates.append((historical.start(), historical.end(), "SCJ",
                            f"NÚM. {int(historical.group(1))}"))
+        candidates.sort()
+    scj_title = re.search(
+        rf"(?im)^\s*SENTENCIA\s+DEL\s+[^\n]{{1,140}}?N[ÚU]M\.?\s*"
+        rf"(?P<number>{SCJ_IDENTIFIER_SOURCE})\s*$",
+        opening[:700],
+    )
+    if scj_title:
+        candidates.append((
+            scj_title.start("number"), scj_title.end("number"), "SCJ",
+            canonical_scj_identifier(scj_title.group("number")),
+        ))
         candidates.sort()
     headers = _institutional_headers(opening)
     if len({header[0] for header in headers}) > 1:
@@ -115,6 +144,21 @@ def _primary_identifier(text: str) -> tuple[str, str] | None:
                              and 0 <= header_start - item[0] <= 700]
         if header_court == "SCJ" and historical_titles:
             return min(historical_titles, key=lambda item: item[0])[2:4]
+        titled_identifiers = [
+            item for item in candidates
+            if item[2] == header_court and item[3].startswith("SCJ-")
+            and 0 <= header_start - item[0] <= 700
+            and re.match(
+                r"\s*SENTENCIA\s+DEL\b",
+                opening[opening.rfind("\n", 0, item[0]) + 1:item[0]],
+                re.I,
+            )
+        ]
+        titled_numbers = {item[3] for item in titled_identifiers}
+        if header_court == "SCJ" and len(titled_numbers) == 1:
+            return min(titled_identifiers, key=lambda item: item[0])[2:4]
+        if header_court == "SCJ" and len(titled_numbers) > 1:
+            return None
         nearby = [item for item in candidates
                   if header_start - 120 <= item[0] <= header_end + 1200]
         aligned = [item for item in nearby if item[2] == header_court]
@@ -174,6 +218,10 @@ def primary_decision_number(text: str, court: str | None):
 def decision_number_matches(text: str, court: str | None, expected: str | None):
     identified = primary_decision_number(text, court)
     if not expected: return identified is not None
+    if court == "SCJ":
+        expected_identifier = canonical_scj_identifier(expected)
+        if expected_identifier:
+            return identified is not None and expected_identifier == identified
     return identified is not None and fold(identified) == fold(expected)
 
 def evidence_classification_fields() -> dict[str, Any]:

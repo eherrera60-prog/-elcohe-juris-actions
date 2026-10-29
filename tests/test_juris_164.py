@@ -8,6 +8,7 @@ import httpx
 
 from app import (
     app,
+    canonical_scj_identifier,
     decision_number_matches,
     fetch_document,
     primary_decision_number,
@@ -126,6 +127,95 @@ class FoundationExtractionTests(unittest.TestCase):
         self.assert_evidence_is_not_a_verified_criterion(result)
         self.assertTrue(result["query_found"])
         self.assertFalse(result["ratio_decidendi_verified"])
+
+    def test_scj_title_number_before_chamber_verifies_and_allows_excerpt_reading(self):
+        text = (
+            "SENTENCIA DEL 29 DE ABRIL DE 2022, NÚM. SCJ-PS-22-1231\n"
+            + ("Datos de identificación del expediente. " * 14)
+            + "\nLa PRIMERA SALA DE LA SUPREMA CORTE DE JUSTICIA\n"
+            "LA SALA, DESPUÉS DE HABER DELIBERADO, CONSIDERA QUE:\n"
+            "1) Esta Suprema Corte rechaza el recurso de casación."
+        )
+        self.payload["expected_number"] = "SCJ-PS-22-1231"
+        with patch("app.fetch_document", new=AsyncMock(return_value=official_pdf())), \
+             patch("app.extract_document_text", return_value=document(text)):
+            verified = self.client.post("/v1/verify-official-pdf", json=self.payload)
+            excerpt = self.client.post("/v1/decision-excerpt", json={
+                **self.payload, "page": 1, "query": "rechaza el recurso",
+            })
+        self.assertEqual(verified.status_code, 200)
+        self.assertEqual(verified.json()["status"], "PDF_TEXT_VERIFIED")
+        self.assertTrue(verified.json()["expected_number_match"])
+        self.assertEqual(excerpt.status_code, 200)
+        self.assertTrue(excerpt.json()["query_found"])
+        self.assertIn("rechaza el recurso", excerpt.json()["excerpt"])
+
+    def test_scj_identifier_normalizes_extraction_layout_without_loosening_identity(self):
+        text = (
+            "SUPREMA CORTE DE JUSTICIA\n"
+            "SENTENCIA SCJ –\n PS –\n 22 –\n 1231\n"
+            "Citada: SCJ-PS-22-9999."
+        )
+        self.assertEqual(
+            primary_decision_number(text, "SCJ"), "SCJ-PS-22-1231"
+        )
+        self.assertTrue(
+            decision_number_matches(text, "SCJ", "NÚM. SCJ PS 22 1231")
+        )
+        self.assertEqual(
+            canonical_scj_identifier("SCJ – PS – 22 – 1231"),
+            "SCJ-PS-22-1231",
+        )
+        self.assertFalse(
+            decision_number_matches(text, "SCJ", "SCJ-PS-22-9999")
+        )
+        self.assertIsNone(canonical_scj_identifier("SCJ-PS-22-12"))
+        self.assertIsNone(canonical_scj_identifier("SCJ-PS-20222-1231"))
+
+    def test_multiple_scj_title_identifiers_remain_unresolved(self):
+        text = (
+            "SENTENCIA DEL 29 DE ABRIL DE 2022, NÚM. SCJ-PS-22-1231\n"
+            "SENTENCIA DEL 30 DE ABRIL DE 2022, NÚM. SCJ-PS-22-1232\n"
+            "PRIMERA SALA DE LA SUPREMA CORTE DE JUSTICIA\n"
+        )
+        self.assertIsNone(primary_decision_number(text, "SCJ"))
+        self.assertFalse(
+            decision_number_matches(text, "SCJ", "SCJ-PS-22-1231")
+        )
+
+    def test_verify_official_pdf_rejects_incomplete_wrong_court_and_wrong_number(self):
+        self.payload["expected_number"] = "SCJ-PS-22-1231"
+        cases = [
+            (document("", extraction_ok=False), "SCJ", "SCJ-PS-22-1231"),
+            (
+                document(
+                    "TRIBUNAL CONSTITUCIONAL\n"
+                    "SENTENCIA TC/0042/24\n"
+                    "Citada: SCJ-PS-22-1231."
+                ),
+                "SCJ",
+                "SCJ-PS-22-1231",
+            ),
+            (
+                document(
+                    "SUPREMA CORTE DE JUSTICIA\n"
+                    "SENTENCIA SCJ-PS-22-1231."
+                ),
+                "SCJ",
+                "SCJ-PS-22-1232",
+            ),
+        ]
+        for extracted, expected_court, expected_number in cases:
+            with self.subTest(expected_court=expected_court, expected_number=expected_number), \
+                 patch("app.fetch_document", new=AsyncMock(return_value=official_pdf())), \
+                 patch("app.extract_document_text", return_value=extracted):
+                result = self.client.post("/v1/verify-official-pdf", json={
+                    **self.payload,
+                    "expected_court": expected_court,
+                    "expected_number": expected_number,
+                }).json()
+            self.assertEqual(result["status"], "PDF_REQUIRES_REVIEW")
+            self.assertFalse(result["expected_number_match"])
 
     def test_promote_holding_keeps_criterion_unverified_without_review(self):
         with patch("app.fetch_document", new=AsyncMock(return_value=official_pdf())), \
@@ -947,7 +1037,7 @@ dicta la siguiente sentencia.
         payload = {
             "recordsFiltered": 1,
             "data": [{
-                "noSentencia": "SCJ-TS-24-00123",
+                "noSentencia": "NÚM. SCJ-PS-22-1231",
                 "noUnico": "2024-R00001",
                 "descTribunal": "PRIMERA SALA",
                 "fechaFallo": "2024-03-04",
@@ -962,6 +1052,10 @@ dicta la siguiente sentencia.
         self.assertEqual(results[0]["source_status"], "NOT_VERIFIED")
         self.assertEqual(results[0]["identity_status"], "NOT_VERIFIED")
         self.assertEqual(results[0]["passage_status"], "NOT_VERIFIED")
+        self.assertEqual(results[0]["decision_number"], "SCJ-PS-22-1231")
+        self.assertEqual(
+            results[0]["reported_decision_number"], "NÚM. SCJ-PS-22-1231"
+        )
         self.assertFalse(results[0]["ratio_decidendi_verified"])
 
     def test_unofficial_document_link_is_not_returned_as_official_source(self):

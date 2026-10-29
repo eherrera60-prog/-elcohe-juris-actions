@@ -42,3 +42,10 @@ informa aparte. En el TC, la consulta confirma el término y el año reflejados
 por la página oficial. Los números, fechas, tribunales y enlaces se devuelven
 solo cuando aparecen en los datos de la fuente. Un HTTP 200 por sí solo no
 confirma una búsqueda satisfactoria.
+
+Los resultados SCJ incluyen `source_url` y `decision_number` como entradas
+directas para `verifyOfficialPdf`; este número se normaliza al identificador
+jurisprudencial cuando el portal lo presenta con prefijos como `NÚM.`. La
+verificación sigue requiriendo PDF de dominio oficial, extracción suficiente,
+tribunal e identificador confirmados en el contenido documental. Los resultados
+del buscador continúan siendo candidatos hasta superar esos controles.

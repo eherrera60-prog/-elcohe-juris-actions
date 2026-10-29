@@ -100,6 +100,8 @@ def _official_document_url(value: object, allowed_host) -> str | None:
 
 
 def _scj_candidates(payload: object, allowed_host) -> tuple[list[dict], int] | None:
+    from app import canonical_scj_identifier
+
     if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
         return None
     try:
@@ -116,6 +118,7 @@ def _scj_candidates(payload: object, allowed_host) -> tuple[list[dict], int] | N
             continue
         number = row.get("noSentencia")
         number = number.strip() if isinstance(number, str) and number.strip() else None
+        canonical_number = canonical_scj_identifier(number)
         case_number = row.get("noUnico")
         case_number = case_number.strip() if isinstance(case_number, str) and case_number.strip() else None
         document_url = _official_document_url(row.get("urlBlob"), allowed_host)
@@ -136,7 +139,7 @@ def _scj_candidates(payload: object, allowed_host) -> tuple[list[dict], int] | N
         }
         source_fields = {
             "tribunal": row.get("descTribunal"),
-            "decision_number": number,
+            "decision_number": canonical_number or number,
             "case_number": case_number,
             "date": row.get("fechaFallo"),
             "source_url": document_url,
@@ -146,6 +149,8 @@ def _scj_candidates(payload: object, allowed_host) -> tuple[list[dict], int] | N
             for field, value in source_fields.items()
             if isinstance(value, str) and value.strip()
         })
+        if canonical_number and canonical_number != number:
+            candidate["reported_decision_number"] = number
         results.append(candidate)
     return results, count
 
