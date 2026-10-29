@@ -267,6 +267,7 @@ async def _search_scj_official_archive(
                     "status": "ACCESS_FAILED",
                     "search_url": str(response.url),
                     "results": [],
+                    "search_executed": False,
                     "message": "La búsqueda oficial redirigió fuera del dominio judicial permitido.",
                 }
             search_url = str(response.url)
@@ -275,6 +276,7 @@ async def _search_scj_official_archive(
                     "status": "EXTRACTION_FAILED",
                     "search_url": str(response.url),
                     "results": [],
+                    "search_executed": True,
                     "message": "El buscador institucional no devolvió HTML interpretable.",
                 }
 
@@ -305,7 +307,8 @@ async def _search_scj_official_archive(
                     None,
                 )
                 fetch_url = (
-                    f"{search_url}?p={post_id}" if post_id else article_url
+                    f"{SCJ_ARCHIVE_SEARCH_URL}?p={post_id}"
+                    if post_id else article_url
                 )
                 article_urls.append((article_url, fetch_url, title))
                 if len(article_urls) >= MAX_SCJ_ARCHIVE_ARTICLES:
@@ -338,6 +341,7 @@ async def _search_scj_official_archive(
             "status": "ACCESS_FAILED",
             "search_url": search_url,
             "results": [],
+            "search_executed": False,
             "error_type": type(exc).__name__,
             "http_status": exc.response.status_code
             if isinstance(exc, httpx.HTTPStatusError) else None,
@@ -349,6 +353,7 @@ async def _search_scj_official_archive(
             "status": "CANDIDATES_FOUND",
             "search_url": search_url,
             "results": results,
+            "search_executed": True,
             "message": (
                 "El buscador institucional enlazó candidatos PDF. Verifique el "
                 "PDF oficial antes de confirmar identidad o contenido."
@@ -359,25 +364,39 @@ async def _search_scj_official_archive(
             "status": "ACCESS_FAILED",
             "search_url": search_url,
             "results": [],
+            "search_executed": True,
             "article_failures": article_failures,
             "message": "No fue posible leer todas las páginas institucionales candidatas.",
         }
-    listing_text = " ".join(listing.get_text(" ", strip=True).split())
-    if re.search(
-        r"\b(?:no se encontraron resultados|no se han encontrado resultados|no results found)\b",
-        listing_text,
-        re.I,
+    body = listing.body
+    body_classes = set(body.get("class", [])) if body else set()
+    empty_results = listing.select_one(
+        ".elementor-posts-container .elementor-posts-nothing-found"
+    )
+    empty_text = (
+        " ".join(empty_results.get_text(" ", strip=True).split())
+        if empty_results else ""
+    )
+    if (
+        "search-no-results" in body_classes
+        and re.search(
+            r"\bparece que no podemos encontrar lo que buscas\b",
+            empty_text,
+            re.I,
+        )
     ):
         return {
             "status": "NO_RESULTS_CONFIRMED",
             "search_url": search_url,
             "results": [],
+            "search_executed": True,
             "message": "El archivo institucional confirmó cero resultados para esta consulta.",
         }
     return {
         "status": "EXTRACTION_FAILED",
         "search_url": search_url,
         "results": [],
+        "search_executed": True,
         "message": (
             "La página del archivo no permitió confirmar resultados ni un estado "
             "explícito de cero coincidencias."
@@ -714,6 +733,7 @@ async def search_scj_candidates(
             response_data["archive_search"] = {
                 "status": archive["status"],
                 "search_url": archive["search_url"],
+                "search_executed": archive.get("search_executed", False),
             }
             if archive["status"] == "CANDIDATES_FOUND":
                 return {

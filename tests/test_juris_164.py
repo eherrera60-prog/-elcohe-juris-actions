@@ -316,7 +316,13 @@ class ScjSearchParsingTests(unittest.TestCase):
         class FakeResponse:
             status_code = 200
             headers = {"content-type": "text/html; charset=utf-8"}
-            text = "<html><body><main>No se encontraron resultados</main></body></html>"
+            text = """<html><body class="search search-no-results">
+              <div class="elementor-posts-container">
+                <div class="elementor-posts-nothing-found">
+                  Parece que no podemos encontrar lo que buscas. Intente nuevamente con otros términos.
+                </div>
+              </div>
+            </body></html>"""
             url = httpx.URL("https://poderjudicial.gob.do/?s=consulta")
 
             def raise_for_status(self):
@@ -342,6 +348,77 @@ class ScjSearchParsingTests(unittest.TestCase):
                 lambda url: None,
             ))
         self.assertEqual(result["status"], "NO_RESULTS_CONFIRMED")
+        self.assertEqual(result["results"], [])
+        self.assertTrue(result["search_executed"])
+
+    def test_scj_archive_generic_empty_text_without_official_state_is_extraction_failure(self):
+        class FakeResponse:
+            status_code = 200
+            headers = {"content-type": "text/html; charset=utf-8"}
+            text = "<html><body><main>No se encontraron resultados</main></body></html>"
+            url = httpx.URL("https://poderjudicial.gob.do/?s=consulta")
+
+            def raise_for_status(self):
+                return None
+
+        class FakeClient:
+            def __init__(self, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+            async def get(self, url, **kwargs):
+                return FakeResponse()
+
+        with patch("juris_164.httpx.AsyncClient", FakeClient):
+            result = asyncio.run(_search_scj_official_archive(
+                "consulta",
+                lambda host: bool(host and host.endswith("poderjudicial.gob.do")),
+                lambda url: None,
+            ))
+        self.assertEqual(result["status"], "EXTRACTION_FAILED")
+        self.assertTrue(result["search_executed"])
+        self.assertEqual(result["results"], [])
+
+    def test_scj_archive_http_403_is_an_access_failure(self):
+        class FakeResponse:
+            status_code = 403
+            headers = {"content-type": "text/html; charset=utf-8"}
+            url = httpx.URL("https://poderjudicial.gob.do/?s=consulta")
+
+            def raise_for_status(self):
+                request = httpx.Request("GET", str(self.url))
+                response = httpx.Response(403, request=request)
+                raise httpx.HTTPStatusError(
+                    "Forbidden", request=request, response=response
+                )
+
+        class FakeClient:
+            def __init__(self, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+            async def get(self, url, **kwargs):
+                return FakeResponse()
+
+        with patch("juris_164.httpx.AsyncClient", FakeClient):
+            result = asyncio.run(_search_scj_official_archive(
+                "consulta",
+                lambda host: bool(host and host.endswith("poderjudicial.gob.do")),
+                lambda url: None,
+            ))
+        self.assertEqual(result["status"], "ACCESS_FAILED")
+        self.assertEqual(result["http_status"], 403)
+        self.assertFalse(result["search_executed"])
         self.assertEqual(result["results"], [])
 
     def test_scj_search_http_403_is_an_access_failure_not_an_empty_search(self):
@@ -539,7 +616,10 @@ dicta la siguiente sentencia.
 
         self.assertEqual(result["status"], "CANDIDATES_FOUND")
         self.assertEqual(len(result["results"]), 1)
-        self.assertTrue(requests[1][0].endswith("?p=41099"))
+        self.assertEqual(
+            str(requests[1][0]),
+            "https://poderjudicial.gob.do/?p=41099",
+        )
         self.assertEqual(requests[1][1], {})
 
     def test_tc_search_extracts_an_official_decision_as_unverified_candidate(self):
@@ -1070,6 +1150,7 @@ dicta la siguiente sentencia.
                 "status": archive_status,
                 "search_url": "https://poderjudicial.gob.do/",
                 "results": [],
+                "search_executed": archive_status != "ACCESS_FAILED",
                 "message": f"Archive reported {archive_status}",
             }
             with self.subTest(archive_status=archive_status), \
@@ -1086,6 +1167,10 @@ dicta la siguiente sentencia.
             self.assertEqual(result["official_results_reported"], 0)
             self.assertEqual(result["results"], [])
             self.assertEqual(result["archive_search"]["status"], archive_status)
+            self.assertEqual(
+                result["archive_search"]["search_executed"],
+                archive_status != "ACCESS_FAILED",
+            )
 
     def test_scj_falls_back_to_first_party_search_after_primary_zero_results(self):
         portal = b"""<html><select id="cbSala"></select><select id="cbMateria"></select>
