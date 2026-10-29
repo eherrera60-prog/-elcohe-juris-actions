@@ -310,6 +310,7 @@ class ScjSearchParsingTests(unittest.TestCase):
             ))
         self.assertEqual(result["status"], "EXTRACTION_FAILED")
         self.assertEqual(result["results"], [])
+        self.assertEqual(result["search_url"], "https://poderjudicial.gob.do/?s=consulta")
 
     def test_scj_archive_explicit_empty_state_confirms_only_that_archive_query(self):
         class FakeResponse:
@@ -957,6 +958,67 @@ dicta la siguiente sentencia.
         self.assertEqual(posted[0][1]["Materia"], "2")
         self.assertEqual(posted[0][1]["Ano"], "2024")
         self.assertEqual(posted[0][1]["Contenido"], "responsabilidad civil")
+
+    def test_scj_search_without_year_uses_the_portals_unfiltered_year_value(self):
+        portal = b"""<html><select id="cbSala"></select><select id="cbMateria"></select>
+          <select id="cbAno"><option value="2024">2024</option></select></html>"""
+        response_body = (
+            b'{"recordsFiltered":1,"recordsTotal":1,"data":[{"noSentencia":"SCJ-TS-24-00123",'
+            b'"urlBlob":"https://consultasentenciascj.poderjudicial.gob.do/decision.pdf"}]}'
+        )
+        posted = []
+
+        class FakeResponse:
+            status_code = 200
+
+            def __init__(self, content, content_type):
+                self.content = content
+                self.headers = {"content-type": content_type}
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+            async def aiter_bytes(self):
+                yield self.content
+
+            def raise_for_status(self):
+                return None
+
+        class FakeClient:
+            def __init__(self, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+            def stream(self, method, url, **kwargs):
+                if method == "GET":
+                    return FakeResponse(portal, "text/html")
+                posted.append(kwargs["data"])
+                return FakeResponse(response_body, "application/json")
+
+        with patch("app.validate_official_url"), \
+             patch("juris_164.httpx.AsyncClient", FakeClient), \
+             patch("juris_164._search_scj_official_archive",
+                   new=AsyncMock()) as search_archive:
+            result = asyncio.run(search_scj_candidates("Constitución", limit=1))
+
+        self.assertEqual(result["status"], "CANDIDATES_FOUND")
+        self.assertTrue(result["search_executed"])
+        self.assertEqual(result["official_results_reported"], 1)
+        self.assertEqual(posted[0]["Ano"], "")
+        self.assertEqual(posted[0]["IdTipoDocumento"], "1")
+        self.assertEqual(result["results"][0]["decision_number"], "SCJ-TS-24-00123")
+        self.assertEqual(result["results"][0]["source_status"], "NOT_VERIFIED")
+        self.assertFalse(result["results"][0]["official_document_verified"])
+        self.assertFalse(result["results"][0]["ratio_decidendi_verified"])
+        search_archive.assert_not_awaited()
 
     def test_scj_primary_zero_preserves_alternative_source_status(self):
         portal = b"""<html><select id="cbSala"><option value="1">PRIMERA SALA</option></select>

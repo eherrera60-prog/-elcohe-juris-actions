@@ -269,6 +269,7 @@ async def _search_scj_official_archive(
                     "results": [],
                     "message": "La búsqueda oficial redirigió fuera del dominio judicial permitido.",
                 }
+            search_url = str(response.url)
             if "html" not in response.headers.get("content-type", "").lower():
                 return {
                     "status": "EXTRACTION_FAILED",
@@ -607,7 +608,7 @@ async def search_scj_candidates(
             matter_id = _option_value(matter_options, matter, "matter")
 
             for year in years:
-                year_id = _option_value(year_options, str(year), "year") if year is not None else "-1"
+                year_id = _option_value(year_options, str(year), "year") if year is not None else ""
                 form = {
                     "draw": "1",
                     "start": "0",
