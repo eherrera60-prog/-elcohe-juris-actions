@@ -22,7 +22,7 @@ class FoundationExtractionRequest(BaseModel):
     expected_court: str = Field(pattern=r"^(TC|SCJ)$")
     expected_number: str = Field(min_length=3, max_length=40)
     legal_issue: str | None = Field(default=None, min_length=3, max_length=300)
-    limit: int = Field(default=12, ge=1, le=20)
+    limit: int = Field(default=12, ge=1, le=30)
 
 
 def _read_options(soup: BeautifulSoup, select_id: str) -> dict[str, str]:
@@ -246,6 +246,8 @@ async def _search_scj_official_archive(
     allowed_host,
     validate_official_url,
 ) -> dict:
+    from app import official_request
+
     search_url = SCJ_ARCHIVE_SEARCH_URL
     validate_official_url(search_url)
     article_urls: list[tuple[str, str, str]] = []
@@ -257,15 +259,14 @@ async def _search_scj_official_archive(
             follow_redirects=True,
             max_redirects=3,
             headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (X11; Linux x86_64) "
-                    "AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36"
-                ),
+                "User-Agent": "ELCOHE-JURIS-RD/1.6.4",
                 "Accept": "text/html,application/xhtml+xml",
             },
             trust_env=False,
         ) as client:
-            response = await client.get(search_url, params={"s": query})
+            response = await official_request(
+                client, "get", search_url, params={"s": query}
+            )
             response.raise_for_status()
             if not allowed_host(response.url.host):
                 return {
@@ -322,7 +323,9 @@ async def _search_scj_official_archive(
             results = []
             for article_url, fetch_url, title in article_urls:
                 try:
-                    article_response = await client.get(fetch_url)
+                    article_response = await official_request(
+                        client, "get", fetch_url
+                    )
                     article_response.raise_for_status()
                 except httpx.HTTPError:
                     article_failures += 1
@@ -419,6 +422,7 @@ def _foundation_payload(req, doc: dict, extracted: dict | None) -> dict:
         evidence_classification_fields,
         extract_metadata_from_text,
         extract_numbered_foundations,
+        extract_dispositive_passage,
         normalize_space,
         score_passage,
     )
@@ -440,6 +444,8 @@ def _foundation_payload(req, doc: dict, extracted: dict | None) -> dict:
         "review_required": True,
         "source_url": doc["final_url"],
         "sha256_pdf": doc["sha256"],
+        "dispositive_status": "NOT_VERIFIED",
+        "dispositive": None,
         "requested_court": req.expected_court,
         "requested_number": req.expected_number,
         "foundations": [],
@@ -481,6 +487,20 @@ def _foundation_payload(req, doc: dict, extracted: dict | None) -> dict:
     })
     units = extract_numbered_foundations(extracted["pages"], court)
     units = annotate_foundation_attribution(units, court)
+    dispositive = extract_dispositive_passage(extracted["pages"])
+    dispositive_payload = None
+    if dispositive:
+        dispositive_text = normalize_space(dispositive["text"])
+        dispositive_payload = {
+            "status": "VERIFIED_PASSAGE",
+            "section": "PART_DISPOSITIVE_CANDIDATE",
+            "page": dispositive["page"],
+            "end_page": dispositive["end_page"],
+            "text": dispositive_text[:5000],
+            "text_truncated": len(dispositive_text) > 5000,
+            "review_required": True,
+            "legal_effect_verified": False,
+        }
     candidates = [
         unit for unit in units
         if unit.get("section") == "DECIDING_COURT" and unit.get("text")
@@ -521,10 +541,17 @@ def _foundation_payload(req, doc: dict, extracted: dict | None) -> dict:
         "status": "VERIFIED_PASSAGE" if passages else "VERIFIED_IDENTITY",
         "passage_status": "VERIFIED_PASSAGE" if passages else "NOT_VERIFIED",
         "foundations": passages,
+        "dispositive_status": (
+            "VERIFIED_PASSAGE" if dispositive_payload else "NOT_VERIFIED"
+        ),
+        "dispositive": dispositive_payload,
         "extraction_diagnostics": {
             "numbered_foundations_detected": len(units),
             "deciding_court_foundations": len(candidates),
             "passages_returned": len(passages),
+            "dispositive_page": (
+                dispositive_payload["page"] if dispositive_payload else None
+            ),
             "limit": req.limit,
         },
         "message": (
@@ -544,7 +571,13 @@ async def search_scj_candidates(
     limit: int = 10,
 ) -> dict:
     """Query the SCJ's public DataTables endpoint; every returned row is a candidate."""
-    from app import SCJ_PORTAL_URL, allowed_host, normalize_space, validate_official_url
+    from app import (
+        SCJ_PORTAL_URL,
+        allowed_host,
+        normalize_space,
+        official_stream_request,
+        validate_official_url,
+    )
 
     normalized_query = normalize_space(q)
     if len(normalized_query) < 2:
@@ -591,31 +624,22 @@ async def search_scj_candidates(
             },
             trust_env=False,
         ) as client:
-            async with client.stream("GET", portal_url) as response:
-                if 300 <= response.status_code < 400:
-                    raise _scj_error(
-                        normalized_query, portal_url, "ACCESS_FAILED",
-                        "El portal SCJ redirigió la consulta inicial.",
-                        http_status=response.status_code,
-                    )
-                response.raise_for_status()
-                content_type = response.headers.get("content-type", "").lower()
-                if "html" not in content_type:
-                    raise _scj_error(
-                        normalized_query, portal_url, "EXTRACTION_FAILED",
-                        "El portal SCJ no devolvió su formulario de búsqueda HTML.",
-                    )
-                chunks = []
-                size = 0
-                async for chunk in response.aiter_bytes():
-                    size += len(chunk)
-                    if size > MAX_SCJ_RESPONSE_BYTES:
-                        raise _scj_error(
-                            normalized_query, portal_url, "EXTRACTION_FAILED",
-                            "El formulario oficial SCJ supera el límite de lectura.",
-                        )
-                    chunks.append(chunk)
-                soup = BeautifulSoup(b"".join(chunks), "html.parser")
+            response, form_body = await official_stream_request(
+                client, "GET", portal_url, max_bytes=MAX_SCJ_RESPONSE_BYTES
+            )
+            if 300 <= response.status_code < 400:
+                raise _scj_error(
+                    normalized_query, portal_url, "ACCESS_FAILED",
+                    "El portal SCJ redirigió la consulta inicial.",
+                    http_status=response.status_code,
+                )
+            content_type = response.headers.get("content-type", "").lower()
+            if "html" not in content_type:
+                raise _scj_error(
+                    normalized_query, portal_url, "EXTRACTION_FAILED",
+                    "El portal SCJ no devolvió su formulario de búsqueda HTML.",
+                )
+            soup = BeautifulSoup(form_body, "html.parser")
 
             try:
                 tribunal_options = _read_options(soup, "cbSala")
@@ -646,9 +670,11 @@ async def search_scj_candidates(
                     "IdTipoDocumento": "1",
                     "Contenido": normalized_query,
                 }
-                async with client.stream(
+                response, body = await official_stream_request(
+                    client,
                     "POST",
                     SCJ_SEARCH_URL,
+                    max_bytes=MAX_SCJ_RESPONSE_BYTES,
                     data=form,
                     headers={
                         "Referer": portal_url,
@@ -656,23 +682,13 @@ async def search_scj_candidates(
                         "X-Requested-With": "XMLHttpRequest",
                         "Accept": "application/json, text/javascript, */*; q=0.01",
                     },
-                ) as response:
-                    if 300 <= response.status_code < 400:
-                        raise _scj_error(
-                            normalized_query, portal_url, "ACCESS_FAILED",
-                            "La búsqueda oficial SCJ redirigió la consulta.",
-                            http_status=response.status_code,
-                        )
-                    response.raise_for_status()
-                    body = bytearray()
-                    async for chunk in response.aiter_bytes():
-                        body.extend(chunk)
-                        if len(body) > MAX_SCJ_RESPONSE_BYTES:
-                            raise _scj_error(
-                                normalized_query, portal_url, "EXTRACTION_FAILED",
-                                "La respuesta oficial SCJ supera el límite de lectura.",
-                                search_executed=True,
-                            )
+                )
+                if 300 <= response.status_code < 400:
+                    raise _scj_error(
+                        normalized_query, portal_url, "ACCESS_FAILED",
+                        "La búsqueda oficial SCJ redirigió la consulta.",
+                        http_status=response.status_code,
+                    )
                 response_data["search_executed"] = True
                 try:
                     payload = json.loads(body)

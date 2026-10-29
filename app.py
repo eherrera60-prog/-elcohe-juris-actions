@@ -1,6 +1,6 @@
 
 from __future__ import annotations
-import hashlib, io, re, unicodedata, ipaddress, socket
+import asyncio, hashlib, io, re, unicodedata, ipaddress, socket
 from typing import Any
 from urllib.parse import urlparse, urljoin
 import httpx
@@ -13,6 +13,8 @@ APP_VERSION = "1.6.4"
 MAX_DOCUMENT_BYTES = 12 * 1024 * 1024
 MAX_PDF_PAGES = 350
 MAX_REDIRECTS = 3
+MAX_OFFICIAL_REQUEST_ATTEMPTS = 3
+RETRYABLE_OFFICIAL_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
 TC_SEARCH_URL = "https://www.tribunalconstitucional.gob.do/consultas/secretar%C3%ADa/sentencias/"
 SCJ_PORTAL_URL = "https://consultasentenciascj.poderjudicial.gob.do/"
 SCJ_ID_SEPARATOR = r"(?:[ \t\r\n]{0,12}[-\u00ad\u2010-\u2014\u2212][ \t\r\n]{0,12}|[ \t\r\n]{1,12})"
@@ -476,38 +478,87 @@ def validate_official_url(url: str):
         if not address.is_global:
             raise HTTPException(400, "La dirección de red no es pública.")
 
+async def official_request(client, method: str, url: str, **kwargs):
+    """Retry safe requests only for transient transport or server failures."""
+    for attempt in range(MAX_OFFICIAL_REQUEST_ATTEMPTS):
+        try:
+            response = await getattr(client, method)(url, **kwargs)
+        except httpx.TransportError:
+            if attempt + 1 == MAX_OFFICIAL_REQUEST_ATTEMPTS:
+                raise
+        else:
+            if (
+                response.status_code not in RETRYABLE_OFFICIAL_STATUS
+                or attempt + 1 == MAX_OFFICIAL_REQUEST_ATTEMPTS
+            ):
+                return response
+        await asyncio.sleep(0.1 * (attempt + 1))
+
+async def official_stream_request(
+    client, method: str, url: str, *, max_bytes: int, **kwargs
+):
+    """Read a bounded official response, retrying only transient failures."""
+    for attempt in range(MAX_OFFICIAL_REQUEST_ATTEMPTS):
+        retry = False
+        try:
+            async with client.stream(method, url, **kwargs) as response:
+                if 300 <= response.status_code < 400:
+                    return response, b""
+                if response.status_code in RETRYABLE_OFFICIAL_STATUS:
+                    if attempt + 1 < MAX_OFFICIAL_REQUEST_ATTEMPTS:
+                        retry = True
+                    else:
+                        response.raise_for_status()
+                else:
+                    response.raise_for_status()
+                    claimed = response.headers.get("content-length")
+                    if claimed and claimed.isdigit() and int(claimed) > max_bytes:
+                        raise HTTPException(413, "El documento supera el límite de lectura permitido.")
+                    chunks = []
+                    size = 0
+                    async for chunk in response.aiter_bytes():
+                        size += len(chunk)
+                        if size > max_bytes:
+                            raise HTTPException(413, "El documento supera el límite de lectura permitido.")
+                        chunks.append(chunk)
+                    return response, b"".join(chunks)
+        except httpx.HTTPStatusError as exc:
+            if (
+                exc.response.status_code not in RETRYABLE_OFFICIAL_STATUS
+                or attempt + 1 == MAX_OFFICIAL_REQUEST_ATTEMPTS
+            ):
+                raise
+            retry = True
+        except httpx.TransportError:
+            if attempt + 1 == MAX_OFFICIAL_REQUEST_ATTEMPTS:
+                raise
+            retry = True
+        if retry:
+            await asyncio.sleep(0.1 * (attempt + 1))
+    raise HTTPException(502, "No se obtuvo una respuesta oficial.")
 
 async def fetch_document(url: str):
     current = url
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(35, connect=10), follow_redirects=False,
-                                     headers={"User-Agent": "ELCOHE-JURIS-RD/1.6.2"}, trust_env=False) as client:
+                                     headers={"User-Agent": f"ELCOHE-JURIS-RD/{APP_VERSION}"}, trust_env=False) as client:
             for hop in range(MAX_REDIRECTS + 1):
                 validate_official_url(current)
-                async with client.stream("GET", current) as response:
-                    if response.status_code in (301, 302, 303, 307, 308):
-                        if hop == MAX_REDIRECTS: raise HTTPException(502, "Demasiadas redirecciones.")
-                        location = response.headers.get("location")
-                        if not location: raise HTTPException(502, "Redirección sin destino.")
-                        current = urljoin(current, location)
-                        continue
-                    response.raise_for_status()
-                    claimed = response.headers.get("content-length")
-                    if claimed and claimed.isdigit() and int(claimed) > MAX_DOCUMENT_BYTES:
-                        raise HTTPException(413, "El documento supera el límite de 12 MB.")
-                    chunks = []; size = 0
-                    async for chunk in response.aiter_bytes():
-                        size += len(chunk)
-                        if size > MAX_DOCUMENT_BYTES:
-                            raise HTTPException(413, "El documento supera el límite de 12 MB.")
-                        chunks.append(chunk)
-                    data = b"".join(chunks)
-                    ct = (response.headers.get("content-type") or "").split(";")[0].lower()
-                    return {"final_url": current, "host": urlparse(current).hostname,
-                            "content_type": ct, "data": data,
-                            "text_response": data.decode(response.encoding or "utf-8", errors="replace") if "html" in ct else None,
-                            "http_status": response.status_code,
-                            "sha256": hashlib.sha256(data).hexdigest()}
+                response, data = await official_stream_request(
+                    client, "GET", current, max_bytes=MAX_DOCUMENT_BYTES
+                )
+                if response.status_code in (301, 302, 303, 307, 308):
+                    if hop == MAX_REDIRECTS: raise HTTPException(502, "Demasiadas redirecciones.")
+                    location = response.headers.get("location")
+                    if not location: raise HTTPException(502, "Redirección sin destino.")
+                    current = urljoin(current, location)
+                    continue
+                ct = (response.headers.get("content-type") or "").split(";")[0].lower()
+                return {"final_url": current, "host": urlparse(current).hostname,
+                        "content_type": ct, "data": data,
+                        "text_response": data.decode(response.encoding or "utf-8", errors="replace") if "html" in ct else None,
+                        "http_status": response.status_code,
+                        "sha256": hashlib.sha256(data).hexdigest()}
     except HTTPException:
         raise
     except httpx.HTTPStatusError as exc:
@@ -559,7 +610,7 @@ def extract_numbered_foundations(pages: list[dict], court: str | None = None) ->
         # Only split after punctuation and an uppercase initial; avoid article
         # numbers, decimal quantities, and citations inside sentences.
         cleaned = re.sub(
-            r"(?<=[.!?;:])([ \t]+)(?=\d{1,3}[).][ \t]+[A-ZÁÉÍÓÚÑ])",
+            r"(?<=[.!?;:])([ \t]+)(?=\d{1,3}[).][ \t]*[A-ZÁÉÍÓÚÑ])",
             "\n", cleaned,
         )
         for line in cleaned.splitlines():
@@ -597,12 +648,12 @@ def extract_numbered_foundations(pages: list[dict], court: str | None = None) ->
                     section = "DISPOSITIVE"
                     continue
             if court == "TC":
-                m = (re.match(r"^(\d{1,2}\.\d{1,2})\.\s+", line)
+                m = (re.match(r"^(\d{1,2}\.\d{1,2})\.?\s*(?=[A-ZÁÉÍÓÚÑ])", line)
                      if section == "DECIDING_COURT" else None)
                 if m is None and section == "DECIDING_COURT":
                     m = re.match(r"^(\d{1,2})\.\s+(?=[A-ZÁÉÍÓÚÑ])", line)
             else:
-                m = (re.match(r"^(\d{1,3})[).]\s+", line)
+                m = (re.match(r"^(\d{1,3})[).]\s*(?=[A-ZÁÉÍÓÚÑ])", line)
                      if section == "DECIDING_COURT" else None)
             if m:
                 if current:
@@ -618,6 +669,64 @@ def extract_numbered_foundations(pages: list[dict], court: str | None = None) ->
     for u in units:
         u["text"] = normalize_space(" ".join(u.pop("lines")))
     return units
+
+def extract_dispositive_passage(pages: list[dict]) -> dict | None:
+    """Extract the final explicit operative section as source text, not legal analysis."""
+    marker = re.compile(r"^\s*(?:FALLA|DECIDE|RESUELVE)\s*:\s*(.*)$", re.I)
+    signature = re.compile(
+        r"^\s*(?:(?:la presente|esta) (?:sentencia|decisi[oó]n)"
+        r".{0,100}\b(?:dada y firmada|firmada por)\b|firmad[oa]\s*:|"
+        r"c[eé]sar jos[eé] garc[ií]a lucas,\s*secretario general|"
+        r"(?:www\.)?poderjudicial\.gob\.do)",
+        re.I,
+    )
+    markers = []
+    cleaned_pages = []
+    for page in pages:
+        text = strip_running_furniture(page.get("text", ""))
+        lines = text.splitlines()
+        cleaned_pages.append((page["page"], lines))
+        for line_index, line in enumerate(lines):
+            if marker.match(line):
+                markers.append((len(cleaned_pages) - 1, line_index))
+    if not markers:
+        return None
+
+    start_page_index, start_line_index = markers[-1]
+    extracted_lines = []
+    end_page = pages[start_page_index]["page"]
+    for page_index in range(start_page_index, len(cleaned_pages)):
+        page_number, lines = cleaned_pages[page_index]
+        start = start_line_index if page_index == start_page_index else 0
+        if page_index > start_page_index:
+            page_counter = next(
+                (
+                    index for index, line in enumerate(lines)
+                    if re.match(r"^\s*P[aá]gina\s+\d+\s+de\s+\d+\b", line, re.I)
+                ),
+                None,
+            )
+            if page_counter is not None:
+                start = page_counter + 1
+        for line in lines[start:]:
+            if signature.match(line):
+                break
+            if normalize_space(line):
+                extracted_lines.append(normalize_space(line))
+                end_page = page_number
+        if any(signature.match(line) for line in lines[start:]):
+            break
+    text = normalize_space(" ".join(extracted_lines))
+    operative_text = re.sub(
+        r"^(?:FALLA|DECIDE|RESUELVE)\s*:\s*", "", text, count=1, flags=re.I
+    ).strip()
+    if not operative_text:
+        return None
+    return {
+        "page": pages[start_page_index]["page"],
+        "end_page": end_page,
+        "text": text,
+    }
 
 
 def annotate_foundation_attribution(units: list[dict], court: str | None = None) -> list[dict]:
@@ -756,7 +865,9 @@ async def _search_tc_candidates(q: str, year: int | None, limit: int) -> dict:
     try:
         async with httpx.AsyncClient(timeout=25, follow_redirects=True,
                                      max_redirects=MAX_REDIRECTS, headers=headers) as client:
-            response = await client.get(TC_SEARCH_URL, params=params)
+            response = await official_request(
+                client, "get", TC_SEARCH_URL, params=params
+            )
             response.raise_for_status()
     except (httpx.HTTPError, httpx.TooManyRedirects) as exc:
         return {"query": search_term, "search_executed": False,
@@ -980,7 +1091,8 @@ async def resolve_official_pdf(req: OfficialPdfRequest):
     if "html" not in doc["content_type"]:
         raise HTTPException(415, "La fuente no es HTML ni PDF.")
     soup = BeautifulSoup(doc["text_response"] or "", "html.parser")
-    candidates = []
+    pdf_links = []
+    expected = re.sub(r"[^a-z0-9]", "", fold(req.expected_number))
     for element in soup.select('a[href], iframe[src], embed[src], object[data]'):
         href = element.get('href') or element.get('src') or element.get('data')
         if not href:
@@ -991,13 +1103,33 @@ async def resolve_official_pdf(req: OfficialPdfRequest):
             continue
         if not parsed.path.lower().endswith('.pdf'):
             continue
-        if url not in candidates:
-            candidates.append(url)
-        if len(candidates) >= 20:
-            break
+        label = " ".join(
+            (element.get_text(" ", strip=True), element.get("title", ""),
+             element.get("download", ""), element.get("aria-label", ""))
+        ).casefold()
+        filename = parsed.path.rsplit("/", 1)[-1]
+        identity_in_filename = bool(
+            expected and expected in re.sub(r"[^a-z0-9]", "", fold(filename))
+        )
+        judgment_label = bool(
+            re.search(r"\b(?:sentencia|fallo|decisi[oó]n|judgment)\b", label)
+        )
+        pdf_links.append((url, identity_in_filename, judgment_label))
+
+    identity_matches = list(dict.fromkeys(
+        url for url, identity_match, _ in pdf_links if identity_match
+    ))
+    if identity_matches:
+        candidates = identity_matches
+    else:
+        contextual_matches = list(dict.fromkeys(
+            url for url, _, judgment_label in pdf_links if judgment_label
+        ))
+        candidates = contextual_matches if len(contextual_matches) == 1 else []
+    candidates = candidates[:20]
     return {"status": "PDF_CANDIDATES_FOUND" if candidates else "PDF_NOT_DISCOVERED",
             "candidates": candidates, "source_url": doc["final_url"],
-            "note": "Los enlaces son candidatos; la identidad y el contenido requieren verifyOfficialPdf."}
+            "note": "Los enlaces se priorizan por el identificador solicitado o su contexto judicial; la identidad solo se confirma verificando el contenido del PDF."}
 
 @app.post("/v1/verify-official-pdf", operation_id="verifyOfficialPdf")
 async def verify_official_pdf(req: OfficialPdfRequest):

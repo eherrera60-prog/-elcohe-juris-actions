@@ -49,3 +49,14 @@ jurisprudencial cuando el portal lo presenta con prefijos como `NÚM.`. La
 verificación sigue requiriendo PDF de dominio oficial, extracción suficiente,
 tribunal e identificador confirmados en el contenido documental. Los resultados
 del buscador continúan siendo candidatos hasta superar esos controles.
+
+Las solicitudes a fuentes oficiales reintentan hasta dos veces solo ante
+timeouts, fallos de transporte y respuestas transitorias (408, 425, 429 y
+5xx seleccionados). Los estados 403 y 404 no se reintentan ni se eluden.
+`/v1/resolve-official-pdf` prioriza enlaces PDF cuyo nombre coincide con el
+número solicitado; el nombre del archivo solo ayuda a localizar candidatos y
+nunca verifica identidad. `/v1/extract-foundations` incluye pasajes
+dispositivos extraídos con páginas de origen, pero su efecto jurídico y la
+ratio decidendi requieren revisión humana. La extracción está limitada a 30
+fundamentos por solicitud; los diagnósticos informan cuántos se detectaron y
+cuántos se devolvieron.

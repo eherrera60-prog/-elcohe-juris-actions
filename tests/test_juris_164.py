@@ -10,7 +10,11 @@ from app import (
     app,
     canonical_scj_identifier,
     decision_number_matches,
+    extract_dispositive_passage,
+    extract_numbered_foundations,
     fetch_document,
+    official_request,
+    official_stream_request,
     primary_decision_number,
     search_tc,
     search_tc_decisions,
@@ -30,6 +34,8 @@ En fecha 4 de marzo de 2024.
 LA SALA, DESPUÉS DE HABER DELIBERADO, CONSIDERA QUE:
 1) Esta Suprema Corte establece que la interpretación debe atender el caso concreto.
 El Tribunal Constitucional, mediante sentencia TC/0099/22, fue citado como precedente.
+FALLA:
+ÚNICO: RECHAZA el recurso de casación.
 """
 
 
@@ -99,6 +105,16 @@ class FoundationExtractionTests(unittest.TestCase):
         self.assertEqual(passage["page"], 1)
         self.assertIn("Esta Suprema Corte establece", passage["passage"])
         self.assertFalse(passage["ratio_decidendi_verified"])
+        self.assertEqual(result["dispositive_status"], "VERIFIED_PASSAGE")
+        self.assertEqual(result["dispositive"]["page"], 1)
+        self.assertIn("RECHAZA el recurso", result["dispositive"]["text"])
+        self.assertFalse(result["dispositive"]["legal_effect_verified"])
+
+    def test_foundation_limit_supports_document_with_more_than_twenty_sections(self):
+        self.payload["limit"] = 27
+        response = self.post_extraction()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["extraction_diagnostics"]["limit"], 27)
 
     def test_analyze_decision_distinguishes_extracted_text_from_criterion(self):
         with patch("app.fetch_document", new=AsyncMock(return_value=official_pdf())), \
@@ -329,6 +345,8 @@ class ScjSearchParsingTests(unittest.TestCase):
                 self.assertIn(f"HTTP {status_code}", raised.exception.detail)
 
     def test_fetch_document_reports_timeout_type(self):
+        attempts = 0
+
         class FakeClient:
             def __init__(self, **kwargs):
                 pass
@@ -340,6 +358,8 @@ class ScjSearchParsingTests(unittest.TestCase):
                 return None
 
             def stream(self, method, url):
+                nonlocal attempts
+                attempts += 1
                 raise httpx.ReadTimeout("official source timed out")
 
         with patch("app.validate_official_url"), \
@@ -349,6 +369,225 @@ class ScjSearchParsingTests(unittest.TestCase):
                     "https://poderjudicial.gob.do/documento.pdf"
                 ))
         self.assertIn("ReadTimeout", raised.exception.detail)
+        self.assertEqual(attempts, 3)
+
+    def test_fetch_document_retries_transient_timeout_and_recovers(self):
+        attempts = 0
+
+        class FakeResponse:
+            status_code = 200
+            headers = {"content-type": "application/pdf", "content-length": "8"}
+            encoding = "utf-8"
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+            async def aiter_bytes(self):
+                yield b"%PDF-1.7"
+
+            def raise_for_status(self):
+                return None
+
+        class FakeClient:
+            def __init__(self, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+            def stream(self, method, url):
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    raise httpx.ReadTimeout("transient official timeout")
+                return FakeResponse()
+
+        with patch("app.validate_official_url"), \
+             patch("app.httpx.AsyncClient", FakeClient), \
+             patch("app.asyncio.sleep", new=AsyncMock()):
+            result = asyncio.run(fetch_document(
+                "https://poderjudicial.gob.do/documento.pdf"
+            ))
+        self.assertEqual(attempts, 2)
+        self.assertEqual(result["data"], b"%PDF-1.7")
+        self.assertEqual(result["http_status"], 200)
+
+    def test_official_stream_request_does_not_retry_forbidden_or_missing_documents(self):
+        for status_code in (403, 404):
+            with self.subTest(status_code=status_code):
+                attempts = 0
+
+                class FakeResponse:
+                    headers = {}
+
+                    def __init__(self):
+                        self.status_code = status_code
+
+                    async def __aenter__(self):
+                        return self
+
+                    async def __aexit__(self, *args):
+                        return None
+
+                    async def aiter_bytes(self):
+                        yield b""
+
+                    def raise_for_status(self):
+                        request = httpx.Request(
+                            "GET", "https://poderjudicial.gob.do/documento.pdf"
+                        )
+                        response = httpx.Response(status_code, request=request)
+                        raise httpx.HTTPStatusError(
+                            "Official source rejected request",
+                            request=request,
+                            response=response,
+                        )
+
+                class FakeClient:
+                    def stream(self, method, url):
+                        nonlocal attempts
+                        attempts += 1
+                        return FakeResponse()
+
+                with self.assertRaises(httpx.HTTPStatusError), \
+                     patch("app.asyncio.sleep", new=AsyncMock()):
+                    asyncio.run(official_stream_request(
+                        FakeClient(), "GET",
+                        "https://poderjudicial.gob.do/documento.pdf",
+                        max_bytes=1024,
+                    ))
+                self.assertEqual(attempts, 1)
+
+    def test_official_request_retries_timeout_and_transient_status(self):
+        attempts = 0
+
+        class FakeClient:
+            async def get(self, url):
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    raise httpx.ReadTimeout("transient official timeout")
+                request = httpx.Request("GET", url)
+                return httpx.Response(
+                    503 if attempts == 2 else 200, request=request
+                )
+
+        with patch("app.asyncio.sleep", new=AsyncMock()):
+            response = asyncio.run(official_request(
+                FakeClient(), "get", "https://www.tribunalconstitucional.gob.do/"
+            ))
+        self.assertEqual(attempts, 3)
+        self.assertEqual(response.status_code, 200)
+
+    def test_resolve_tc_pdf_prefers_identity_matched_document_over_unrelated_files(self):
+        html_doc = {
+            **official_pdf(),
+            "final_url": "https://www.tribunalconstitucional.gob.do/consultas/sentencias/tc001924",
+            "host": "www.tribunalconstitucional.gob.do",
+            "content_type": "text/html",
+            "data": b"<html>metadata</html>",
+            "text_response": """
+              <a href="https://tribunalsitestorage.blob.core.windows.net/media/tc-0019-24.pdf">Descargar</a>
+              <a href="https://tribunalsitestorage.blob.core.windows.net/media/iso-certificado.pdf">Certificado</a>
+            """,
+        }
+        request = {
+            "url": html_doc["final_url"],
+            "expected_court": "TC",
+            "expected_number": "TC/0019/24",
+        }
+        with patch("app.fetch_document", new=AsyncMock(return_value=html_doc)):
+            response = TestClient(app).post("/v1/resolve-official-pdf", json=request)
+        self.assertEqual(response.status_code, 200)
+        result = response.json()
+        self.assertEqual(result["status"], "PDF_CANDIDATES_FOUND")
+        self.assertEqual(
+            result["candidates"],
+            ["https://tribunalsitestorage.blob.core.windows.net/media/tc-0019-24.pdf"],
+        )
+
+    def test_resolve_pdf_does_not_return_unrelated_official_documents(self):
+        html_doc = {
+            **official_pdf(),
+            "final_url": "https://www.tribunalconstitucional.gob.do/consultas/sentencias/tc001924",
+            "host": "www.tribunalconstitucional.gob.do",
+            "content_type": "text/html",
+            "data": b"<html>metadata</html>",
+            "text_response": """
+              <a href="https://tribunalsitestorage.blob.core.windows.net/media/iso-certificate.pdf">Certificado</a>
+              <a href="https://tribunalsitestorage.blob.core.windows.net/media/annual-report.pdf">Informe</a>
+            """,
+        }
+        with patch("app.fetch_document", new=AsyncMock(return_value=html_doc)):
+            response = TestClient(app).post("/v1/resolve-official-pdf", json={
+                "url": html_doc["final_url"],
+                "expected_court": "TC",
+                "expected_number": "TC/0019/24",
+            })
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "PDF_NOT_DISCOVERED")
+        self.assertEqual(response.json()["candidates"], [])
+
+    def test_dispositive_extraction_uses_final_explicit_marker_and_page_range(self):
+        pages = [
+            {"page": 1, "text": "Cita: FALLA: anterior decisión citada."},
+            {"page": 2, "text": "DECIDE:\nPRIMERO: ADMITE la acción.\nSEGUNDO: ACOGE la acción."},
+            {
+                "page": 3,
+                "text": (
+                    "TRIBUNAL CONSTITUCIONAL\n"
+                    "Expediente núm. TC-01-2024\n"
+                    "parte recurrente y decisión impugnada\n"
+                    "Página 3 de 3\n"
+                    "TERCERO: ORDENA la notificación.\n"
+                    "Tribunal Constitucional.\n"
+                    "La presente decisión es dada y firmada por los jueces."
+                ),
+            },
+        ]
+        result = extract_dispositive_passage(pages)
+        self.assertEqual(result["page"], 2)
+        self.assertEqual(result["end_page"], 3)
+        self.assertIn("SEGUNDO: ACOGE", result["text"])
+        self.assertIn("TERCERO: ORDENA", result["text"])
+        self.assertIn("Tribunal Constitucional", result["text"])
+        self.assertNotIn("decisión impugnada", result["text"])
+        self.assertNotIn("anterior decisión citada", result["text"])
+        self.assertNotIn("dada y firmada", result["text"])
+
+    def test_scj_foundation_markers_without_extraction_space_are_retained(self):
+        pages = [{
+            "page": 1,
+            "text": (
+                "LA SALA, DESPUÉS DE HABER DELIBERADO:\n"
+                "1) Primer fundamento judicial.\n"
+                "2)Segundo fundamento judicial."
+            ),
+        }]
+        units = extract_numbered_foundations(pages, "SCJ")
+        self.assertEqual([unit["foundation_number"] for unit in units], ["1", "2"])
+
+    def test_tc_decimal_foundations_are_extracted_as_distinct_page_anchored_units(self):
+        pages = [{
+            "page": 3,
+            "text": (
+                "II. Consideraciones y fundamentos\n"
+                "9. Admisibilidad del recurso\n"
+                "9.1 Previo a referirnos a la admisibilidad.\n"
+                "9.2En cuanto al plazo aplicable."
+            ),
+        }]
+        units = extract_numbered_foundations(pages, "TC")
+        self.assertEqual(
+            [unit["foundation_number"] for unit in units], ["9", "9.1", "9.2"]
+        )
+        self.assertTrue(all(unit["page"] == unit["end_page"] == 3 for unit in units))
 
     def test_scj_search_plan_is_explicitly_not_executed_and_does_not_claim_filters_applied(self):
         response = TestClient(app).get(
