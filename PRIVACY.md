@@ -1,6 +1,6 @@
 # Política de Privacidad — ELCOHE-JURIS RD Jurisprudence Actions
 
-**Última actualización:** 12 de octubre de 2026
+**Última actualización:** 29 de octubre de 2026
 
 ELCOHE-JURIS RD Jurisprudence Actions es un servicio técnico destinado a apoyar la búsqueda, localización y verificación de fuentes jurídicas públicas de la República Dominicana, en particular jurisprudencia de la Suprema Corte de Justicia (SCJ) y del Tribunal Constitucional (TC).
 
@@ -8,7 +8,13 @@ ELCOHE-JURIS RD Jurisprudence Actions es un servicio técnico destinado a apoyar
 
 El servicio puede recibir los parámetros necesarios para ejecutar una consulta jurídica, tales como términos de búsqueda, año, materia, sala, número de sentencia, expediente o una URL de un documento jurídico que el usuario solicite verificar.
 
-La aplicación no solicita deliberadamente nombres, cédulas, direcciones, contraseñas, datos bancarios ni otra información personal sensible para prestar sus funciones ordinarias.
+La aplicación no solicita deliberadamente cédulas, direcciones, contraseñas,
+datos bancarios ni otra información personal sensible para prestar sus
+funciones ordinarias. Para el control de acceso individual, el proveedor OIDC
+envía una identidad seudónima (`sub`); ELCOHE-JURIS conserva ese identificador,
+su estado de autorización, quién lo autorizó y las fechas de cambio. La
+autenticación y los datos de cuenta se rigen también por la política del
+proveedor de identidad.
 
 ## 2. Finalidad del tratamiento
 
@@ -17,11 +23,17 @@ Los datos enviados a la API se utilizan exclusivamente para:
 - preparar búsquedas jurisprudenciales;
 - localizar decisiones o documentos jurídicos públicos;
 - verificar si una URL corresponde a una fuente oficial;
-- devolver metadatos técnicos necesarios para la investigación jurídica.
+- devolver metadatos técnicos necesarios para la investigación jurídica;
+- comprobar si la identidad autenticada está autorizada, suspendida o revocada
+  y registrar los cambios administrativos de acceso.
 
 ## 3. Conservación y registros técnicos
 
-La aplicación no está diseñada para crear perfiles de usuarios ni para almacenar historiales jurídicos personales como parte de su funcionalidad.
+La aplicación conserva la lista de autorizaciones y un registro de auditoría de
+cambios de estado en PostgreSQL. No almacena los tokens OAuth, contraseñas ni
+los historiales de consultas como parte del control de acceso. El administrador
+puede consultar la lista y la auditoría; los registros deben conservarse y
+respaldarse conforme a la configuración del proveedor PostgreSQL.
 
 No obstante, el proveedor de alojamiento y otros proveedores de infraestructura pueden generar registros técnicos temporales, por ejemplo direcciones IP, fecha y hora de acceso, ruta consultada, códigos de respuesta y otros datos necesarios para seguridad, diagnóstico y funcionamiento del servicio. Dichos registros se rigen también por las políticas del proveedor correspondiente.
 

@@ -5,3 +5,4 @@ beautifulsoup4==4.12.3
 pydantic==2.10.4
 pypdf==5.1.0
 psycopg[binary]==3.2.6
+PyJWT[crypto]==2.10.1

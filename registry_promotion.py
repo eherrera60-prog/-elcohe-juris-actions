@@ -76,7 +76,12 @@ def _digest(req: LegalApprovalRequest) -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
-@router.post("/holdings/approve", operation_id="approveReviewedHolding", dependencies=[Depends(require_admin)])
+@router.post(
+    "/holdings/approve",
+    operation_id="approveReviewedHolding",
+    dependencies=[Depends(require_admin)],
+    include_in_schema=False,
+)
 async def approve_reviewed_holding(req: LegalApprovalRequest):
     """Aprobación por revisor declarado. Verifica nuevamente PDF oficial y citas antes de escritura."""
     from app import fetch_document, extract_document_text, detect_court, court_matches, decision_number_matches, normalized_contains, strip_running_furniture, locate_support_context, attribution_context

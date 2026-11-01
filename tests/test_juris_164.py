@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 from fastapi import HTTPException
 import httpx
 
+from auth_access import require_active_user
 from app import (
     app,
     canonical_scj_identifier,
@@ -61,12 +62,19 @@ def official_pdf():
 
 class FoundationExtractionTests(unittest.TestCase):
     def setUp(self):
+        app.dependency_overrides[require_active_user] = lambda: {
+            "sub": "test-admin",
+            "role": "admin",
+        }
         self.client = TestClient(app)
         self.payload = {
             "url": "https://consultasentenciascj.poderjudicial.gob.do/documento.pdf",
             "expected_court": "SCJ",
             "expected_number": "SCJ-TS-24-00123",
         }
+
+    def tearDown(self):
+        app.dependency_overrides.clear()
 
     def post_extraction(self, doc=None, extracted=None, extraction_error=None):
         with patch("app.fetch_document", new=AsyncMock(return_value=doc or official_pdf())):
@@ -299,6 +307,15 @@ class FoundationExtractionTests(unittest.TestCase):
 
 
 class ScjSearchParsingTests(unittest.TestCase):
+    def setUp(self):
+        app.dependency_overrides[require_active_user] = lambda: {
+            "sub": "test-admin",
+            "role": "admin",
+        }
+
+    def tearDown(self):
+        app.dependency_overrides.clear()
+
     def test_fetch_document_reports_official_source_http_status(self):
         for status_code in (403, 404):
             with self.subTest(status_code=status_code):

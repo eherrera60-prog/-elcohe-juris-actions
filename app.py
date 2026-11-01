@@ -5,9 +5,11 @@ from typing import Any
 from urllib.parse import urlparse, urljoin
 import httpx
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi.openapi.utils import get_openapi
 from pydantic import BaseModel, HttpUrl, Field
 from pypdf import PdfReader
+from auth_access import require_active_user, require_admin, router as access_router
 
 APP_VERSION = "1.6.4"
 MAX_DOCUMENT_BYTES = 12 * 1024 * 1024
@@ -33,7 +35,10 @@ ALLOWED_HOST_SUFFIXES = (
 app = FastAPI(
     title="ELCOHE-JURIS RD Jurisprudence Actions",
     version=APP_VERSION,
-    description="Verificación, lectura y análisis jurisprudencial dominicano."
+    description="Verificación, lectura y análisis jurisprudencial dominicano.",
+    docs_url=None,
+    redoc_url=None,
+    dependencies=[Depends(require_active_user)],
 )
 
 class VerifyRequest(BaseModel):
@@ -842,9 +847,9 @@ def find_relevant_passages(pages, issue, limit, court=None):
 
 def normalized_contains(haystack, needle): return fold(needle) in fold(haystack)
 
-@app.get("/health", operation_id="healthCheck")
+@app.get("/health", operation_id="healthCheck", openapi_extra={"security": []})
 def health():
-    return {"ok":True,"service":"ELCOHE-JURIS RD Jurisprudence Actions","version":APP_VERSION}
+    return {"ok": True}
 
 async def _search_tc_candidates(q: str, year: int | None, limit: int) -> dict:
     """Locate candidates on the official TC portal; never certify a holding here."""
@@ -1218,7 +1223,12 @@ async def read_official_decision_excerpt(req: DecisionExcerptRequest):
         "review_required": True,
     }
 
-@app.post("/v1/promote-holding", operation_id="promoteVerifiedHolding")
+@app.post(
+    "/v1/promote-holding",
+    operation_id="promoteVerifiedHolding",
+    dependencies=[Depends(require_admin)],
+    include_in_schema=False,
+)
 async def promote_verified_holding(req:HoldingPromotionRequest):
     doc=await fetch_document(str(req.url)); ex=extract_document_text(doc); court=detect_court(doc["host"],req.expected_court,ex["full_text"]); meta=extract_metadata_from_text(ex["full_text"],court)
     reasons=[]; gates={}
@@ -1284,9 +1294,12 @@ async def promote_verified_holding(req:HoldingPromotionRequest):
     if ok: reasons.append("Los controles heurísticos no acreditan por sí solos la ratio decidendi; no se emite certificación automática.")
     return {"status":"HOLDING_REQUIRES_INDEPENDENT_LEGAL_REVIEW" if ok else "HOLDING_NOT_PROMOTED",**evidence_classification_fields(),"court":court,"metadata":meta,"legal_issue":req.legal_issue,"legal_proposition":None,"support":{"page":req.support_page,"quote":req.support_quote if support_exact else None,"outcome_page":req.outcome_page,"outcome_quote":req.outcome_quote if outcome_ok else None},"gates":gates,"reasons":reasons,"verification_note":"La verificación documental y los indicadores de atribución no prueban por sí mismos la ratio decidendi. Requiere juicio jurídico humano y cotejo del dispositivo.","source_url":doc["final_url"],"sha256":doc["sha256"]}
 
-# Registro persistente opcional; sin DATABASE_URL no altera los endpoints existentes.
+# Registro persistente de fuentes verificadas.
 from registry import router as registry_router
 app.include_router(registry_router)
+
+# Acceso individual y administración restringida a identidades bootstrap.
+app.include_router(access_router)
 
 # Aprobación jurídica humana auditable (sin modificar los endpoints legados).
 from registry_promotion import router as registry_promotion_router
@@ -1295,3 +1308,20 @@ from juris_163 import install
 install(app)
 from juris_164 import install as install_164
 install_164(app)
+
+
+def _openapi_schema():
+    if app.openapi_schema:
+        return app.openapi_schema
+    schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+    )
+    schema["paths"]["/health"]["get"]["security"] = []
+    app.openapi_schema = schema
+    return schema
+
+
+app.openapi = _openapi_schema

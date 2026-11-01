@@ -1,14 +1,17 @@
 """Registro PostgreSQL de decisiones verificadas; no certifica ratio decidendi."""
 from __future__ import annotations
-import hmac
-import os
 from typing import Any
-from urllib.parse import urlparse
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field, HttpUrl
+from auth_access import (
+    connect_db as connect,
+    require_active_user,
+    require_admin,
+)
 
 router = APIRouter(prefix="/v1/registry", tags=["Registro jurisprudencial"])
+require_read_access = require_active_user
 
 class RegisterRequest(BaseModel):
     url: HttpUrl
@@ -16,49 +19,6 @@ class RegisterRequest(BaseModel):
     expected_number: str = Field(min_length=4, max_length=80)
     legal_issue: str | None = Field(default=None, max_length=500)
     max_passages: int = Field(default=6, ge=1, le=12)
-
-
-def require_admin(x_elcohe_admin_token: str | None = Header(default=None)):
-    configured = os.getenv("ELCOHE_REGISTRY_ADMIN_TOKEN", "")
-    if not configured:
-        raise HTTPException(503, "Registro no configurado: falta ELCOHE_REGISTRY_ADMIN_TOKEN.")
-    if not x_elcohe_admin_token or not hmac.compare_digest(x_elcohe_admin_token, configured):
-        raise HTTPException(401, "Token de registro inválido.")
-
-
-def require_read_access(x_elcohe_admin_token: str | None = Header(default=None),
-                        x_elcohe_read_token: str | None = Header(default=None)):
-    """Read-only token or existing admin token. Writes remain admin-only."""
-    admin = os.getenv("ELCOHE_REGISTRY_ADMIN_TOKEN", "")
-    reader = os.getenv("ELCOHE_REGISTRY_READ_TOKEN", "")
-    if not reader:
-        raise HTTPException(503, "Acceso de lectura no configurado: falta ELCOHE_REGISTRY_READ_TOKEN.")
-    if admin and hmac.compare_digest(reader, admin):
-        raise HTTPException(503, "Los tokens de lectura y administración deben ser diferentes.")
-    read_ok = bool(x_elcohe_read_token and hmac.compare_digest(x_elcohe_read_token, reader))
-    admin_ok = bool(admin and x_elcohe_admin_token and hmac.compare_digest(x_elcohe_admin_token, admin))
-    if not (read_ok or admin_ok):
-        raise HTTPException(401, "Credencial de consulta inválida.")
-
-
-def db_url() -> str:
-    url = os.getenv("DATABASE_URL", "").strip()
-    if not url:
-        raise HTTPException(503, "Registro no configurado: falta DATABASE_URL.")
-    parsed = urlparse(url)
-    if parsed.scheme not in ("postgres", "postgresql") or not parsed.hostname:
-        raise HTTPException(503, "DATABASE_URL debe ser una conexión PostgreSQL válida.")
-    return url
-
-
-def connect():
-    try:
-        import psycopg
-        return psycopg.connect(db_url(), connect_timeout=8, autocommit=False)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(503, f"No se pudo conectar al registro PostgreSQL ({type(exc).__name__}).")
 
 
 SCHEMA = """
@@ -97,7 +57,12 @@ def row_to_dict(row: tuple, fields: list[str]) -> dict[str, Any]:
     return dict(zip(fields, row))
 
 
-@router.post("/decisions", operation_id="registerVerifiedDecision", dependencies=[Depends(require_admin)])
+@router.post(
+    "/decisions",
+    operation_id="registerVerifiedDecision",
+    dependencies=[Depends(require_admin)],
+    include_in_schema=False,
+)
 async def register_decision(req: RegisterRequest):
     # Importación diferida: reutiliza exactamente el verificador de la aplicación original.
     from app import AnalyzeDecisionRequest, analyze_official_decision
