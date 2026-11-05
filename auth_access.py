@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
 
-AUTH0_AUDIENCE = "https://elcohe-juris-163-test.onrender.com"
+AUTH0_AUDIENCE = "https://elcohe-juris-164-final"
 REQUIRED_PERMISSION = "access:jurisprudence"
 
 
