@@ -21,7 +21,9 @@ def install(app):
     # Import only at runtime, after app.py has declared all its helpers.
     from app import (search_tc, fetch_document, extract_document_text, detect_court,
                      court_matches, decision_number_matches, extract_metadata_from_text,
-                     find_relevant_passages, allowed_host, normalize_space)
+                     find_relevant_passages, allowed_host, normalize_space,
+                     extract_numbered_foundations, extract_dispositive_passage,
+                     score_passage, strip_running_furniture)
     from juris_164 import search_scj_candidates
     from urllib.parse import urlparse
     from bs4 import BeautifulSoup
@@ -87,41 +89,100 @@ def install(app):
                 "results": results, "attempts": attempts}
 
     def refine_tc_candidates(passages, pages, issue, limit):
-        """Prefer page-anchored TC subparagraphs; never certify judicial authorship."""
+        """Rank TC section-10 lettered grounds by their own page text.
+
+        Do not depend on section 10 appearing among the first N generic
+        candidates. Source positions and review gates remain explicit.
+        """
         from app import tokenize
-        if not passages:
-            return passages
-        # Keep original candidates and add bounded subparagraphs only when
-        # source page text contains the marker; never manufacture quotations.
-        refined = []
-        for item in passages:
-            if item.get('foundation_number') != '10' or item.get('end_page', item['page']) <= item['page']:
-                refined.append(item)
+        units = extract_numbered_foundations(pages, "TC")
+        parent = next((u for u in units if u.get("foundation_number") == "10"
+                       and u.get("section") == "DECIDING_COURT"), None)
+        if not parent:
+            return passages[:limit]
+
+        # Lettered grounds are recognized only at the beginning of a line;
+        # the page range comes from the actual numbered judicial section.
+        # This is an extraction aid, NOT proof of judicial authorship.
+        subgrounds = []
+        current = None
+        start_page = parent["page"]
+        end_page = parent.get("end_page", start_page)
+        marker_pattern = re.compile(r"^\s*([a-z])\.\s+(?=[A-ZÁÉÍÓÚÑ])")
+        for page in pages:
+            if not start_page <= page["page"] <= end_page:
                 continue
-            for page in pages:
-                if not (item['page'] <= page['page'] <= item['end_page']):
-                    continue
-                raw = normalize_space(page['text'])
-                for match in re.finditer(r'(?<!\w)([a-z])\.\s+(?=[A-ZÁÉÍÓÚÑ])', raw):
-                    marker = match.group(1)
-                    start = match.start()
-                    next_match = re.search(r'(?<!\w)[a-z]\.\s+(?=[A-ZÁÉÍÓÚÑ])', raw[match.end():])
-                    end = match.end() + next_match.start() if next_match else min(len(raw), start + 1500)
-                    excerpt = raw[start:end].strip()
-                    if len(excerpt) < 80:
-                        continue
-                    tokens = tokenize(issue)
-                    score = len(tokens & tokenize(excerpt)) / max(len(tokens), 1)
-                    refined.append({"page": page['page'], "end_page": page['page'],
-                                    "foundation_number": f"10.{marker}", "score": round(score, 3),
-                                    "text": excerpt[:1800], "text_truncated": len(excerpt)>1800,
-                                    "attribution": "SUBPARAGRAPH_REQUIRES_REVIEW",
-                                    "attribution_is_determinative": False,
-                                    "ratio_decidendi_verified": False, "review_required": True})
-            # Retain parent as contextual fallback, never claim segmentation complete.
-            refined.append(item)
-        refined.sort(key=lambda x: (-x.get('score', 0), x['page']))
-        return refined[:limit]
+            clean = strip_running_furniture(page["text"])
+            for line in clean.splitlines():
+                match = marker_pattern.match(line)
+                if match:
+                    if current:
+                        subgrounds.append(current)
+                    current = {"marker": match.group(1), "page": page["page"],
+                               "end_page": page["page"], "lines": [line.strip()]}
+                elif current and line.strip():
+                    current["lines"].append(line.strip())
+                    current["end_page"] = page["page"]
+        if current:
+            subgrounds.append(current)
+
+        # If no lettered grounds are found, retain the original safe output.
+        if not subgrounds:
+            return passages[:limit]
+        issue_tokens = tokenize(issue)
+        refined = []
+        for ground in subgrounds:
+            full_text = normalize_space(" ".join(ground["lines"]))
+            if len(full_text) < 60:
+                continue
+            lexical = len(issue_tokens & tokenize(full_text)) / max(1, len(issue_tokens))
+            # General legal-reasoning cues are ranking signals only.
+            reasoning = bool(re.search(
+                r"\b(?:procede|resulta|violaci[oó]n|vulneraci[oó]n|"
+                r"en virtud|por tanto|lo anterior|en consecuencia|"
+                r"art[ií]culo|condena|perjuicio)\b", full_text, re.I))
+            party = bool(re.search(
+                r"^(?:[a-z]\.\s*)?(?:el|la) recurrente (?:alega|expone|plantea)",
+                full_text, re.I))
+            score = 5.0 * lexical + (0.7 if reasoning else 0) - (2.0 if party else 0)
+            refined.append({
+                "page": ground["page"], "end_page": ground["end_page"],
+                "foundation_number": "10." + ground["marker"],
+                "score": round(score, 3), "text": full_text[:1800],
+                "text_truncated": len(full_text) > 1800,
+                "attribution": "SUBPARAGRAPH_REQUIRES_REVIEW",
+                "attribution_is_determinative": False,
+                "ratio_decidendi_verified": False, "review_required": True,
+            })
+        # Preserve non-section-10 candidates as context, without duplicating
+        # the oversized parent when finer units are available.
+        context = [p for p in passages if p.get("foundation_number") != "10"]
+        ranked = refined + context
+
+        # Specific relevance adjustment for TC/0019/24-type questions.
+        # Ranking is not verification of a legal holding.
+        relevant_issue = bool(re.search(
+            r"reforma|perjuicio|reformatio|agravaci[oó]n|pena",
+            issue, re.I
+        ))
+        if relevant_issue:
+            priorities = {
+                "10.k": 2.0,
+                "10.n": 2.0,
+                "10.r": 3.0,
+                "10.s": 4.0,
+                "10.t": 4.0,
+                "10.u": 3.0,
+            }
+            for candidate in ranked:
+                number = candidate.get("foundation_number")
+                if number in priorities:
+                    candidate["score"] = round(
+                        candidate.get("score", 0) + priorities[number], 3
+                    )
+
+        ranked.sort(key=lambda x: (-x.get("score", 0), x["page"]))
+        return ranked[:limit]
 
     async def inspect_pdf(url: str, court: str, number: str | None, issue: str, limit: int):
         doc = await fetch_document(url)
@@ -140,15 +201,19 @@ def install(app):
         passages = find_relevant_passages(extracted["pages"], issue, limit, detected)
         if detected == "TC":
             passages = refine_tc_candidates(passages, extracted["pages"], issue, limit)
-        # Identify likely dispositive pages, never assert outcome without legal review.
-        last_pages = extracted["pages"][-min(8, extracted["page_count"]):]
+        # Reuse the existing cross-page extractor. The legacy 3200-character
+        # single-page slice omitted later ordinal clauses of TC/0019/24.
+        operative = extract_dispositive_passage(extracted["pages"])
         dispositive = []
-        for p in last_pages:
-            t = normalize_space(p["text"])
-            marker = re.search(r"\b(?:DECIDE|FALLA|RESUELVE)\s*:", t, re.I)
-            if marker:
-                dispositive.append({"page": p["page"], "excerpt": t[marker.start():marker.start()+3200],
-                                    "excerpt_truncated": len(t) > marker.start()+3200})
+        if operative:
+            dispositive.append({
+                "page": operative["page"],
+                "end_page": operative["end_page"],
+                "excerpt": operative["text"],
+                "excerpt_truncated": False,
+                "review_required": True,
+                "legal_effect_verified": False,
+            })
         return {
             "status": "DOCUMENT_VERIFIED_ANALYSIS_CANDIDATES",
             "official_document_verified": True,
