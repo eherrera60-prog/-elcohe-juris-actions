@@ -413,6 +413,7 @@ async def _search_scj_official_archive(
 
 
 def _foundation_payload(req, doc: dict, extracted: dict | None) -> dict:
+    from foundation_origin_165 import classify_contextual_origin
     from app import (
         allowed_host,
         annotate_foundation_attribution,
@@ -533,6 +534,7 @@ def _foundation_payload(req, doc: dict, extracted: dict | None) -> dict:
             "passage_truncated": len(passage) > 5000,
             "attribution": unit.get("attribution"),
             "attribution_indicators": unit.get("attribution_indicators", []),
+            **classify_contextual_origin(unit),
             "attribution_verified": False,
             "ratio_decidendi_verified": False,
             "review_required": True,
@@ -559,6 +561,8 @@ def _foundation_payload(req, doc: dict, extracted: dict | None) -> dict:
             "La atribución judicial y la ratio decidendi requieren revisión jurídica humana."
         ),
     })
+    from document_continuity_165 import identify_page_continuities
+    base['document_continuity'] = identify_page_continuities(units)
     return base
 
 

@@ -1,0 +1,14 @@
+{
+  "version": "1.6.5",
+  "branch": "elcohe-juris-1.6.5-desarrollo",
+  "http_status": 200,
+  "official_document_verified": true,
+  "source_status": "VERIFIED_SOURCE",
+  "identity_status": "VERIFIED_IDENTITY",
+  "page_count": 6,
+  "foundations_returned": 20,
+  "continuity_16_17_verified": true,
+  "ratio_decidendi_automatically_verified": false,
+  "human_review_required": true,
+  "result": "APPROVED"
+}

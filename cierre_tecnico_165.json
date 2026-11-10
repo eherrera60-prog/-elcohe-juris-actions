@@ -1,0 +1,26 @@
+{
+  "branch": "elcohe-juris-1.6.5-desarrollo",
+  "automated_tests": {
+    "passed": true
+  },
+  "document_continuity": {
+    "pages": 6,
+    "units": 20,
+    "candidates": [
+      {
+        "unit_before": 16,
+        "unit_after": 17,
+        "start_page": 5,
+        "end_page": 6,
+        "human_review_required": true
+      }
+    ]
+  },
+  "authenticated_http": {
+    "existing_authentication_tests_passed": true,
+    "real_document_endpoint_tested": false,
+    "note": "La suite confirma el mecanismo de acceso existente. No constituye todavía una solicitud autenticada al endpoint con el documento oficial."
+  },
+  "production_modified": false,
+  "publication_authorized": false
+}

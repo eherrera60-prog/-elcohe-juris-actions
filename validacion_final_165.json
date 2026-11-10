@@ -1,0 +1,7 @@
+{
+  "branch": "elcohe-juris-1.6.5-desarrollo",
+  "continuity_integration": true,
+  "automated_tests_passed": true,
+  "authenticated_http_with_official_pdf": false,
+  "publication_authorized": false
+}
