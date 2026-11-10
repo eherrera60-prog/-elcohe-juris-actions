@@ -20,7 +20,7 @@ MAX_SCJ_ARCHIVE_ARTICLES = 12
 class FoundationExtractionRequest(BaseModel):
     url: HttpUrl
     expected_court: str = Field(pattern=r"^(TC|SCJ)$")
-    expected_number: str = Field(min_length=3, max_length=40)
+    expected_number: str = Field(min_length=1, max_length=40)
     legal_issue: str | None = Field(default=None, min_length=3, max_length=300)
     limit: int = Field(default=12, ge=1, le=30)
 
@@ -690,14 +690,43 @@ async def search_scj_candidates(
                         http_status=response.status_code,
                     )
                 response_data["search_executed"] = True
+
+                response_type = response.headers.get(
+                    "content-type", ""
+                ).split(";", 1)[0].strip().lower()
+
+                if response.status_code != 200:
+                    return {
+                        **response_data,
+                        "status": "ACCESS_FAILED",
+                        "results": results[:limit],
+                        "http_status": response.status_code,
+                        "response_content_type": response_type,
+                        "message": (
+                            "El buscador SCJ devolvió un estado HTTP "
+                            "distinto de 200."
+                        ),
+                    }
+
                 try:
                     payload = json.loads(body)
-                except (json.JSONDecodeError, UnicodeDecodeError):
+                except (
+                    json.JSONDecodeError,
+                    UnicodeDecodeError,
+                    TypeError,
+                ):
                     return {
                         **response_data,
                         "status": "EXTRACTION_FAILED",
-                        "results": [],
-                        "message": "La respuesta del portal SCJ no contiene JSON interpretable.",
+                        "results": results[:limit],
+                        "http_status": response.status_code,
+                        "response_content_type": response_type,
+                        "response_bytes": len(body),
+                        "message": (
+                            "El buscador SCJ respondió, pero el contenido "
+                            "no es JSON interpretable. No se confirma "
+                            "ausencia de sentencias."
+                        ),
                     }
                 parsed = _scj_candidates(payload, allowed_host)
                 if parsed is None:

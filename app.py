@@ -222,14 +222,23 @@ def primary_decision_number(text: str, court: str | None):
     return identifier[1] if identifier and identifier[0] == court else None
 
 
-def decision_number_matches(text: str, court: str | None, expected: str | None):
+
+def decision_number_matches(text, court, expected):
     identified = primary_decision_number(text, court)
-    if not expected: return identified is not None
+    if identified is None:
+        return False
+    if not expected:
+        return True
     if court == "SCJ":
-        expected_identifier = canonical_scj_identifier(expected)
-        if expected_identifier:
-            return identified is not None and expected_identifier == identified
-    return identified is not None and fold(identified) == fold(expected)
+        canonical = canonical_scj_identifier(expected)
+        if canonical:
+            return canonical == identified
+        pattern = r"(?:N[ÚU]M\.?\s*)?(\d+)"
+        a = re.fullmatch(pattern, normalize_space(expected), re.I)
+        b = re.fullmatch(pattern, normalize_space(identified), re.I)
+        if a:
+            return b is not None and int(a.group(1)) == int(b.group(1))
+    return fold(identified) == fold(expected)
 
 def evidence_classification_fields() -> dict[str, Any]:
     return {
@@ -673,6 +682,32 @@ def extract_numbered_foundations(pages: list[dict], court: str | None = None) ->
         units.append(current)
     for u in units:
         u["text"] = normalize_space(" ".join(u.pop("lines")))
+
+    if court == "SCJ" and not units:
+        active = False
+        for page in pages:
+            cleaned = strip_running_furniture(page["text"])
+            for paragraph in re.split(r"\n\s*\n", cleaned):
+                paragraph = normalize_space(paragraph)
+                if not paragraph:
+                    continue
+                normalized = fold(paragraph)
+                if "despues de haber deliberado" in normalized:
+                    active = True
+                    continue
+                if active and re.match(r"^(FALLA|DECIDE|RESUELVE)\s*:", paragraph, re.I):
+                    active = False
+                    break
+                if active and len(paragraph) >= 80:
+                    units.append({
+                        "foundation_number": None,
+                        "page": page["page"],
+                        "end_page": page["page"],
+                        "text": paragraph,
+                        "section": "DECIDING_COURT",
+                        "historical_unnumbered": True,
+                        "review_required": True
+                    })
     return units
 
 def extract_dispositive_passage(pages: list[dict]) -> dict | None:
