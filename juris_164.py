@@ -487,7 +487,53 @@ def _foundation_payload(req, doc: dict, extracted: dict | None) -> dict:
         "official_document_verified": True,
     })
     units = extract_numbered_foundations(extracted["pages"], court)
+    from document_continuity_165 import (
+        identify_page_continuities,
+        merge_verified_page_continuities,
+    )
+    continuity_candidates = identify_page_continuities(units)
+    units = merge_verified_page_continuities(units)
     units = annotate_foundation_attribution(units, court)
+
+    # Refinamiento conservador de atribuciones explícitas.
+    # No certifica autoría ni ratio decidendi.
+    if court == "SCJ":
+        from foundation_origin_165 import classify_contextual_origin
+
+        explicit_origins = {
+            "cassation_arguments_introduction": "PARTY_ARGUMENT_OR_MIXED_REVIEW",
+            "respondent_arguments": "PARTY_ARGUMENT_OR_MIXED_REVIEW",
+            "explicit_statutory_definition": "STATUTORY_QUOTATION_REVIEW",
+        }
+
+        for unit in units:
+            classification = classify_contextual_origin(unit)
+            indicators = classification.get(
+                "origin_classification_indicators", []
+            )
+
+            for indicator, attribution in explicit_origins.items():
+                if indicator not in indicators:
+                    continue
+
+                previous = unit.get("attribution")
+
+                if previous and previous.startswith("LOWER_COURT"):
+                    unit["attribution_previous"] = previous
+                    unit["attribution"] = attribution
+                    unit["attribution_indicators"] = [
+                        item for item in unit.get(
+                            "attribution_indicators", []
+                        )
+                        if item != "within_lower_court_quotation_scope"
+                    ] + [
+                        "explicit_contextual_transition",
+                        indicator,
+                    ]
+                    unit["attribution_verified"] = False
+                    unit["review_required"] = True
+
+                break
     dispositive = extract_dispositive_passage(extracted["pages"])
     dispositive_payload = None
     if dispositive:
@@ -533,6 +579,7 @@ def _foundation_payload(req, doc: dict, extracted: dict | None) -> dict:
             "passage": passage[:5000],
             "passage_truncated": len(passage) > 5000,
             "attribution": unit.get("attribution"),
+            "attribution_previous": unit.get("attribution_previous"),
             "attribution_indicators": unit.get("attribution_indicators", []),
             **classify_contextual_origin(unit),
             "attribution_verified": False,
@@ -561,8 +608,7 @@ def _foundation_payload(req, doc: dict, extracted: dict | None) -> dict:
             "La atribución judicial y la ratio decidendi requieren revisión jurídica humana."
         ),
     })
-    from document_continuity_165 import identify_page_continuities
-    base['document_continuity'] = identify_page_continuities(units)
+    base["document_continuity"] = continuity_candidates
     return base
 
 

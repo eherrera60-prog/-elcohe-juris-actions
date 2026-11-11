@@ -66,7 +66,9 @@ def classify_contextual_origin(unit):
         if re.search(pattern, normalized, re.I):
             base["reasoning_origin"] = origin
             base["origin_classification_indicators"] = (
-                indicators + [indicator]
+                [x for x in indicators
+                 if x != "within_lower_court_quotation_scope"]
+                + [indicator]
             )
             break
 

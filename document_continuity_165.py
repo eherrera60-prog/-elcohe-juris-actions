@@ -47,3 +47,42 @@ def identify_page_continuities(units):
         })
 
     return results
+
+
+def merge_verified_page_continuities(units):
+    """Une continuidades sintácticas candidatas sin verificar autoría."""
+    from copy import deepcopy
+
+    merged = deepcopy(units)
+    index = 0
+
+    while index < len(merged) - 1:
+        left = merged[index]
+        right = merged[index + 1]
+
+        candidates = identify_page_continuities([left, right])
+
+        compatible = (
+            bool(candidates)
+            and left.get("section") == right.get("section")
+            and left.get("foundation_number") is None
+            and right.get("foundation_number") is None
+            and left.get("historical_unnumbered") is True
+            and right.get("historical_unnumbered") is True
+            and right.get("page") == left.get("end_page", left.get("page")) + 1
+        )
+
+        if not compatible:
+            index += 1
+            continue
+
+        left["text"] = (
+            left["text"].rstrip() + " " +
+            right["text"].lstrip()
+        )
+        left["end_page"] = right.get("end_page", right["page"])
+        left["page_continuity_merged"] = True
+        left["review_required"] = True
+        merged.pop(index + 1)
+
+    return merged
