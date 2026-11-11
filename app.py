@@ -11,7 +11,7 @@ from pydantic import BaseModel, HttpUrl, Field
 from pypdf import PdfReader
 from auth_access import require_active_user, require_admin, router as access_router
 
-APP_VERSION = "1.6.4"
+APP_VERSION = "1.6.5"
 MAX_DOCUMENT_BYTES = 12 * 1024 * 1024
 MAX_PDF_PAGES = 350
 MAX_REDIRECTS = 3
