@@ -1,11 +1,7 @@
-"""
-ELCOHE-JURIS RD 1.6.5
-Prueba controlada de persistencia PostgreSQL.
-"""
 
+import json
 import os
 import uuid
-import hashlib
 from urllib.parse import urlsplit
 
 import psycopg
@@ -13,35 +9,56 @@ import psycopg
 HOST = "dpg-dbi0vsei0phs73ch9pdg-a"
 BASE = "elcohe_juris_164_db"
 PUERTO = 5432
-TABLA = "elcohe_admin_persistence_test"
+SERVICIO = "elcohe-juris-163-test"
+
+MARCADOR = "ELCOHE-JURIS-165-CERTIFICACION-UNICA"
+
+
+def informar(**datos):
+    print(
+        "ELCOHE_PERSISTENCE_165_RESULT "
+        + json.dumps(datos, ensure_ascii=False),
+        flush=True,
+    )
+    return datos
 
 
 def ejecutar_prueba():
-    if os.getenv("ELCOHE_DB_TEST_ISOLATED") != "true":
-        return {"ok": False, "estado": "BLOQUEADO"}
 
-    if os.getenv("ELCOHE_PERSISTENCE_TEST_ONCE") != "true":
-        return {"ok": False, "estado": "BLOQUEADO"}
+    if os.getenv("RENDER_SERVICE_NAME") != SERVICIO:
+        return informar(
+            ok=False,
+            estado="SERVICIO_NO_AUTORIZADO",
+        )
+
+    if (
+        os.getenv("ELCOHE_DB_TEST_ISOLATED") != "true"
+        or os.getenv("ELCOHE_PERSISTENCE_TEST_ONCE") != "true"
+    ):
+        return informar(
+            ok=False,
+            estado="AUTORIZACION_PENDIENTE",
+        )
 
     url = os.getenv("DATABASE_URL")
 
     if not url:
-        return {"ok": False, "estado": "SIN_DATABASE_URL"}
+        return informar(
+            ok=False,
+            estado="DATABASE_URL_AUSENTE",
+        )
 
     destino = urlsplit(url)
 
     if (
         destino.hostname != HOST
-        or destino.path.lstrip("/") != BASE
         or destino.port not in (None, PUERTO)
+        or destino.path.lstrip("/") != BASE
     ):
-        return {"ok": False, "estado": "DESTINO_NO_AUTORIZADO"}
-
-    identificador = str(uuid.uuid4())
-    contenido = "ELCOHE-JURIS-RD-1.6.5"
-    insertado = False
-    recuperado = False
-    eliminado = False
+        return informar(
+            ok=False,
+            estado="DESTINO_NO_AUTORIZADO",
+        )
 
     def conectar():
         conexion = psycopg.connect(
@@ -50,19 +67,34 @@ def ejecutar_prueba():
             sslmode="require",
         )
 
-        with conexion.cursor() as cursor:
-            cursor.execute(
-                "SELECT current_database(), inet_server_port()"
-            )
-            base, puerto = cursor.fetchone()
+        try:
+            with conexion.cursor() as cursor:
+                cursor.execute(
+                    "SELECT current_database(), inet_server_port()"
+                )
+                base, puerto = cursor.fetchone()
 
-        if base != BASE or puerto != PUERTO:
+            if base != BASE or puerto != PUERTO:
+                raise RuntimeError("IDENTIDAD_POSTGRESQL_INCORRECTA")
+
+            return conexion
+
+        except Exception:
             conexion.close()
-            raise RuntimeError("IDENTIDAD_INCORRECTA")
+            raise
 
-        return conexion
+    identificador = "prueba:" + str(uuid.uuid4())
+    contenido = "ELCOHE-JURIS-RD-1.6.5"
+
+    escritura = False
+    recuperacion = False
+    eliminacion = False
+    error = None
+    reservado = False
 
     try:
+        # Reserva persistente: la clave primaria impide repetir
+        # esta certificación en reinicios posteriores.
         with conectar() as conexion:
             with conexion.cursor() as cursor:
                 cursor.execute("""
@@ -77,11 +109,33 @@ def ejecutar_prueba():
                     INSERT INTO elcohe_admin_persistence_test
                     (id, contenido)
                     VALUES (%s, %s)
+                    ON CONFLICT (id) DO NOTHING
+                    RETURNING id
+                """, (MARCADOR, "EJECUCION_RESERVADA"))
+
+                reservado = cursor.fetchone() is not None
+
+            conexion.commit()
+
+        if not reservado:
+            return informar(
+                ok=False,
+                estado="CERTIFICACION_YA_RESERVADA",
+            )
+
+        # Escritura confirmada.
+        with conectar() as conexion:
+            with conexion.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO elcohe_admin_persistence_test
+                    (id, contenido)
+                    VALUES (%s, %s)
                 """, (identificador, contenido))
 
             conexion.commit()
-            insertado = True
+            escritura = True
 
+        # Lectura desde una nueva conexión.
         with conectar() as conexion:
             with conexion.cursor() as cursor:
                 cursor.execute("""
@@ -92,7 +146,7 @@ def ejecutar_prueba():
 
                 fila = cursor.fetchone()
 
-            recuperado = (
+            recuperacion = (
                 fila is not None
                 and fila[0] == contenido
             )
@@ -100,11 +154,8 @@ def ejecutar_prueba():
     except Exception as exc:
         error = type(exc).__name__
 
-    else:
-        error = None
-
     finally:
-        if insertado:
+        if reservado:
             try:
                 with conectar() as conexion:
                     with conexion.cursor() as cursor:
@@ -112,7 +163,6 @@ def ejecutar_prueba():
                             DELETE FROM elcohe_admin_persistence_test
                             WHERE id = %s
                         """, (identificador,))
-                        eliminados = cursor.rowcount
 
                     conexion.commit()
 
@@ -123,24 +173,47 @@ def ejecutar_prueba():
                             FROM elcohe_admin_persistence_test
                             WHERE id = %s
                         """, (identificador,))
+
                         restantes = cursor.fetchone()[0]
 
-                eliminado = eliminados == 1 and restantes == 0
+                eliminacion = restantes == 0
 
-            except Exception:
-                eliminado = False
+            except Exception as exc:
+                eliminacion = False
+                error = "LIMPIEZA_" + type(exc).__name__
 
-    correcto = insertado and recuperado and eliminado
+    correcto = escritura and recuperacion and eliminacion
 
-    return {
-        "ok": correcto,
-        "estado": (
+    if reservado:
+        try:
+            with conectar() as conexion:
+                with conexion.cursor() as cursor:
+                    cursor.execute("""
+                        UPDATE elcohe_admin_persistence_test
+                        SET contenido = %s
+                        WHERE id = %s
+                    """, (
+                        "PERSISTENCIA_VERIFICADA"
+                        if correcto
+                        else "VERIFICACION_INCOMPLETA",
+                        MARCADOR,
+                    ))
+
+                conexion.commit()
+
+        except Exception as exc:
+            correcto = False
+            error = "MARCADOR_" + type(exc).__name__
+
+    return informar(
+        ok=correcto,
+        estado=(
             "PERSISTENCIA_VERIFICADA"
             if correcto
             else "VERIFICACION_INCOMPLETA"
         ),
-        "escritura": insertado,
-        "recuperacion": recuperado,
-        "eliminacion": eliminado,
-        "error": error,
-    }
+        escritura_confirmada=escritura,
+        recuperacion_nueva_conexion=recuperacion,
+        eliminacion_confirmada=eliminacion,
+        error=error,
+    )
