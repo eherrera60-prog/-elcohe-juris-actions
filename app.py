@@ -33,16 +33,7 @@ ALLOWED_HOST_SUFFIXES = (
 )
 
 
-# ELCOHE_POSTGRESQL_165 — DIAGNÓSTICO TEMPORAL
-from contextlib import asynccontextmanager
-
-@asynccontextmanager
-async def _elcohe_postgresql_lifespan(app):
-    from diagnostico_postgresql_165 import verificar_postgresql
-    verificar_postgresql()
-    yield
-
-app = FastAPI(lifespan=_elcohe_postgresql_lifespan,
+app = FastAPI(
     title="ELCOHE-JURIS RD Jurisprudence Actions",
     version=APP_VERSION,
     description="Verificación, lectura y análisis jurisprudencial dominicano.",
