@@ -841,6 +841,9 @@ async def search_scj_candidates(
                     "official_results_reported": reported_count,
                     "status": "CANDIDATES_FOUND",
                     "results": archive["results"][:limit],
+                    "relevance_status": "NOT_VERIFIED",
+                    "legal_relevance_verified": False,
+                    "relevance_review_required": True,
                     "message": archive["message"],
                     "note": (
                         "El buscador principal no devolvió registros. Los enlaces "

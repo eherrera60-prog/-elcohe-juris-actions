@@ -237,7 +237,7 @@ def install(app):
         if req.official_pdf_url:
             if not req.expected_number:
                 raise HTTPException(422, "expected_number es obligatorio para verificar un PDF.")
-            return {"version": "1.6.4", "mode": "DIRECT_OFFICIAL_PDF",
+            return {"version": "1.6.5", "mode": "DIRECT_OFFICIAL_PDF",
                     "result": await inspect_pdf(str(req.official_pdf_url), req.court,
                                                 req.expected_number, req.legal_issue,
                                                 req.max_passages)}
@@ -249,7 +249,7 @@ def install(app):
                 limit=req.max_candidates,
             )
             if not req.expected_number:
-                return {"version": "1.6.4", "mode": "SCJ_OFFICIAL_SEARCH",
+                return {"version": "1.6.5", "mode": "SCJ_OFFICIAL_SEARCH",
                         "status": search["status"], "search": search,
                         "note": "Los resultados SCJ son candidatos. Verifique el PDF, tribunal y número antes de extraer o atribuir fundamentos."}
             results = []
@@ -263,7 +263,7 @@ def install(app):
                     url, "SCJ", req.expected_number, req.legal_issue,
                     req.max_passages
                 ))
-            return {"version": "1.6.4", "mode": "SCJ_SEARCH_AND_VERIFY",
+            return {"version": "1.6.5", "mode": "SCJ_SEARCH_AND_VERIFY",
                     "status": "RESULTS_REQUIRE_LEGAL_REVIEW" if results else search["status"],
                     "search": search, "results": results,
                     "legal_analysis_verified": False, "review_required": True}
@@ -274,7 +274,7 @@ def install(app):
             if fallback and fallback.get("status") == "LOCATED_RESULTS":
                 search = fallback
             else:
-                return {"version": "1.6.4", "status": "SEARCH_UNVERIFIED",
+                return {"version": "1.6.5", "status": "SEARCH_UNVERIFIED",
                         "search": search, "fallback": fallback, "results": [], "review_required": True}
         results = []
         for candidate in search.get("results", [])[:req.max_candidates]:
@@ -309,7 +309,7 @@ def install(app):
             except Exception as exc:
                 results.append({"decision_number": number, "status": "SOURCE_ERROR",
                                 "error_type": type(exc).__name__, "review_required": True})
-        return {"version": "1.6.4", "mode": "TC_SEARCH_AND_VERIFY",
+        return {"version": "1.6.5", "mode": "TC_SEARCH_AND_VERIFY",
                 "status": "RESULTS_REQUIRE_LEGAL_REVIEW", "query": req.legal_issue,
                 "results": results, "legal_analysis_verified": False,
                 "review_required": True}
