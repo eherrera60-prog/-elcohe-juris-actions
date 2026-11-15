@@ -839,11 +839,20 @@ async def search_scj_candidates(
                 "search_executed": archive.get("search_executed", False),
             }
             if archive["status"] == "CANDIDATES_FOUND":
+                # La búsqueda institucional es exploratoria.
+                # No acredita por sí misma pertinencia jurídica.
+                candidatos_evaluados = []
+                for candidato in archive["results"][:limit]:
+                    candidato = dict(candidato)
+                    candidato["relevance_status"] = "NOT_VERIFIED"
+                    candidato["legal_relevance_verified"] = False
+                    candidato["relevance_review_required"] = True
+                    candidatos_evaluados.append(candidato)
                 return {
                     **response_data,
                     "official_results_reported": reported_count,
                     "status": "CANDIDATES_FOUND",
-                    "results": archive["results"][:limit],
+                    "results": candidatos_evaluados,
                     "relevance_status": "NOT_VERIFIED",
                     "legal_relevance_verified": False,
                     "relevance_review_required": True,
