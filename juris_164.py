@@ -259,7 +259,7 @@ async def _search_scj_official_archive(
             follow_redirects=True,
             max_redirects=3,
             headers={
-                "User-Agent": "ELCOHE-JURIS-RD/1.6.4",
+                "User-Agent": "ELCOHE-JURIS-RD/1.6.5",
                 "Accept": "text/html,application/xhtml+xml",
             },
             trust_env=False,
@@ -669,7 +669,7 @@ async def search_scj_candidates(
             timeout=httpx.Timeout(30, connect=10),
             follow_redirects=False,
             headers={
-                "User-Agent": "ELCOHE-JURIS-RD/1.6.4",
+                "User-Agent": "ELCOHE-JURIS-RD/1.6.5",
                 "Accept": "text/html,application/json",
             },
             trust_env=False,
@@ -825,7 +825,10 @@ async def search_scj_candidates(
         )
     else:
         archive = None
-        if not any((chamber, matter, year_from, year_to)):
+        if True:
+            # El archivo institucional es una fuente alternativa.
+            # Sus candidatos requieren verificar posteriormente
+            # sala, materia, fecha y pertinencia jurídica.
             archive = await _search_scj_official_archive(
                 normalized_query, allowed_host, validate_official_url
             )
