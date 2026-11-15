@@ -4,4 +4,4 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY prueba_persistencia_165.py arranque_persistencia_165.py app.py auth_access.py registry.py registry_promotion.py juris_163.py juris_164.py foundation_origin_165.py document_continuity_165.py ./
 ENV PORT=8000
-CMD ["sh", "-c", "python arranque_persistencia_165.py; uvicorn app:app --host 0.0.0.0 --port ${PORT}"]
+CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT}"]
