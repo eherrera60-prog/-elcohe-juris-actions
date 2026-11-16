@@ -864,23 +864,32 @@ async def search_scj_candidates(
                     ),
                 }
             archive_status = archive.get("status")
-            if archive_status in {
-                "NO_RESULTS_CONFIRMED",
-                "ACCESS_FAILED",
-                "EXTRACTION_FAILED",
-            }:
-                status = archive_status
-                message = archive.get(
-                    "message",
-                    "La búsqueda alternativa no pudo confirmar resultados.",
+            response_data["primary_search"] = {
+                "status": "NO_RESULTS_CONFIRMED",
+                "search_executed": True,
+                "official_results_reported": reported_count,
+            }
+
+            if archive_status == "NO_RESULTS_CONFIRMED":
+                status = "NO_RESULTS_CONFIRMED"
+                message = (
+                    "La búsqueda principal y la alternativa informaron "
+                    "cero registros para sus respectivas consultas. "
+                    "Esto no demuestra ausencia de jurisprudencia."
                 )
             else:
-                status = "EXTRACTION_FAILED"
-                message = (
-                    "La búsqueda principal informó cero registros, pero la "
-                    "respuesta del archivo alternativo no permitió clasificar "
-                    "el resultado."
+                status = (
+                    archive_status
+                    if archive_status in {"ACCESS_FAILED", "EXTRACTION_FAILED"}
+                    else "EXTRACTION_FAILED"
                 )
+                message = (
+                    "La búsqueda principal informó cero registros. "
+                    "La búsqueda alternativa no pudo completarse "
+                    "o interpretar sus resultados. "
+                    "No se confirma ausencia de jurisprudencia."
+                )
+
         else:
             status = "NO_RESULTS_CONFIRMED"
             message = (
