@@ -1361,3 +1361,8 @@ def _openapi_schema():
 
 
 app.openapi = _openapi_schema
+
+
+# Portal OAuth independiente de las operaciones jurisprudenciales.
+from web_client_165 import router as web_client_router
+app.include_router(web_client_router)
