@@ -50,6 +50,13 @@ por la página oficial. Los números, fechas, tribunales y enlaces se devuelven
 solo cuando aparecen en los datos de la fuente. Un HTTP 200 por sí solo no
 confirma una búsqueda satisfactoria.
 
+Si las rutas de búsqueda del TC son rechazadas y la consulta contiene un número
+exacto, se intenta la ficha pública de esa sentencia y el PDF oficial que esta
+enlace. Ese resultado sigue siendo un candidato hasta verificar el PDF. No se
+confirma ausencia de sentencias ni se realiza indexación masiva propia; si falla
+la búsqueda temática oficial, el error de acceso se informa sin inventar
+resultados.
+
 Los resultados SCJ incluyen `source_url` y `decision_number` como entradas
 directas para `verifyOfficialPdf`; este número se normaliza al identificador
 jurisprudencial cuando el portal lo presenta con prefijos como `NÚM.`. La

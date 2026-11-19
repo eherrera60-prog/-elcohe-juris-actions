@@ -891,6 +891,120 @@ def normalized_contains(haystack, needle): return fold(needle) in fold(haystack)
 def health():
     return {"ok": True}
 
+
+def _tc_number_parts(value: str) -> tuple[str, str, str] | None:
+    match = re.fullmatch(
+        r"\s*(?:SENTENCIA\s+)?TC\s*/\s*(\d{1,4})\s*/\s*(\d{2})\s*",
+        value,
+        re.I,
+    )
+    if not match:
+        return None
+    digits, year = match.groups()
+    digits = digits.zfill(4)
+    return f"TC/{digits}/{year}", digits, year
+
+
+async def _tc_direct_number_candidate(
+    number_parts: tuple[str, str, str],
+) -> dict:
+    """Resolve one exact public TC decision page without querying the search form."""
+    from urllib.parse import urljoin
+
+    canonical_number, digits, year = number_parts
+    page_url = urljoin(TC_SEARCH_URL, f"tc{digits}{year}")
+    try:
+        document = await fetch_document(page_url)
+    except HTTPException as exc:
+        status_match = re.search(r"\bHTTP\s+(\d{3})\b", str(exc.detail))
+        return {
+            "status": "ACCESS_FAILED",
+            "source_url": page_url,
+            "http_status": int(status_match.group(1)) if status_match else None,
+            "message": (
+                "No fue posible consultar la ficha oficial de la sentencia "
+                "por número."
+            ),
+        }
+
+    if document["data"].startswith(b"%PDF"):
+        pdf_url = document["final_url"]
+    elif "html" in document["content_type"]:
+        soup = BeautifulSoup(document["text_response"] or "", "html.parser")
+        page_text = normalize_space(soup.get_text(" ", strip=True))
+        if not re.search(
+            rf"\bTC\s*/\s*{digits}\s*/\s*{year}\b", page_text, re.I
+        ):
+            return {
+                "status": "EXTRACTION_FAILED",
+                "source_url": document["final_url"],
+                "message": (
+                    "La ficha oficial no confirmó el número de sentencia "
+                    "solicitado."
+                ),
+            }
+
+        filename_pattern = re.compile(
+            rf"tc[-_]?{digits}[-_]{year}(?:\D|$)", re.I
+        )
+        pdf_url = None
+        for element in soup.select(
+            "a[href], iframe[src], embed[src], object[data]"
+        ):
+            target = (
+                element.get("href")
+                or element.get("src")
+                or element.get("data")
+                or ""
+            ).strip()
+            candidate_url = urljoin(document["final_url"], target)
+            parsed = urlparse(candidate_url)
+            if (
+                parsed.scheme == "https"
+                and allowed_host(parsed.hostname)
+                and parsed.path.lower().endswith(".pdf")
+                and filename_pattern.search(
+                    parsed.path.rsplit("/", 1)[-1]
+                )
+            ):
+                pdf_url = candidate_url
+                break
+    else:
+        return {
+            "status": "EXTRACTION_FAILED",
+            "source_url": document["final_url"],
+            "message": (
+                "La ficha oficial por número no devolvió HTML ni un PDF."
+            ),
+        }
+
+    candidate = {
+        "court": "TC",
+        "decision_number": canonical_number,
+        "source_url": pdf_url or document["final_url"],
+        "official_page_url": document["final_url"],
+        "status": "CANDIDATE",
+        "verification_status": "CANDIDATE",
+        "source_status": "NOT_VERIFIED",
+        "identity_status": "NOT_VERIFIED",
+        "passage_status": "NOT_VERIFIED",
+        "official_document_verified": False,
+        "ratio_decidendi_verified": False,
+        "search_source": "OFFICIAL_TC_NUMBER_PAGE",
+    }
+    if pdf_url:
+        candidate["official_pdf_url"] = pdf_url
+    return {
+        "status": "CANDIDATES_FOUND",
+        "results": [candidate],
+        "source_url": document["final_url"],
+        "message": (
+            "Se localizó la ficha oficial por número. El enlace PDF es un "
+            "candidato y requiere verificación documental."
+        ),
+    }
+
+
 async def _search_tc_candidates(q: str, year: int | None, limit: int) -> dict:
     """Locate candidates on the official TC portal; never certify a holding here."""
     # The official TC form filters years separately; appending the year to
@@ -911,6 +1025,9 @@ async def _search_tc_candidates(q: str, year: int | None, limit: int) -> dict:
         })
     headers = {"User-Agent": f"ELCOHE-JURIS-RD/{APP_VERSION}",
                "Accept": "text/html,application/xhtml+xml"}
+    number_parts = _tc_number_parts(search_term)
+    if number_parts and year is not None and int(number_parts[2]) != year % 100:
+        number_parts = None
     try:
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(90.0, connect=10.0),
@@ -921,23 +1038,66 @@ async def _search_tc_candidates(q: str, year: int | None, limit: int) -> dict:
         ) as client:
             response = None
             attempted_urls = []
+            attempted_statuses = []
             for route in (TC_SEARCH_URL,) + TC_SEARCH_URL_FALLBACKS:
                 attempted_urls.append(route)
                 candidate_response = await official_request(
                     client, "get", route, params=params
                 )
+                attempted_statuses.append({
+                    "url": route,
+                    "http_status": candidate_response.status_code,
+                })
                 if candidate_response.status_code not in (406, 404, 410, 421):
                     response = candidate_response
                     break
             if response is None:
+                direct_lookup = (
+                    await _tc_direct_number_candidate(number_parts)
+                    if number_parts else None
+                )
+                direct_results = (
+                    direct_lookup.get("results", [])
+                    if direct_lookup else []
+                )
+                direct_succeeded = bool(direct_results)
+                primary_http_status = (
+                    attempted_statuses[-1]["http_status"]
+                    if attempted_statuses else None
+                )
                 return {
                     "query": search_term,
                     "search_executed": False,
-                    "results": [],
-                    "status": "ACCESS_FAILED",
-                    "message": "Las rutas oficiales del TC rechazaron o no resolvieron la consulta.",
-                    "http_status": 406,
+                    "results": direct_results,
+                    "status": (
+                        "CANDIDATES_FOUND" if direct_succeeded
+                        else "ACCESS_FAILED"
+                    ),
+                    "message": (
+                        (
+                            direct_lookup["message"]
+                            + f" La búsqueda oficial respondió HTTP {primary_http_status}; "
+                            "se consultó la ficha pública exacta como alternativa."
+                        )
+                        if direct_succeeded
+                        else (
+                            "Las rutas oficiales del TC rechazaron o no resolvieron la consulta."
+                            if direct_lookup is None
+                            else (
+                                "El buscador oficial rechazó la consulta y la ficha "
+                                "por número no pudo confirmarse. No se confirma ausencia "
+                                "de sentencias."
+                            )
+                        )
+                    ),
+                    "http_status": primary_http_status,
                     "attempted_official_urls": attempted_urls,
+                    "attempted_official_statuses": attempted_statuses,
+                    "primary_search": {
+                        "status": "ACCESS_FAILED",
+                        "http_status": primary_http_status,
+                    },
+                    "direct_number_lookup": direct_lookup,
                 }
             response.raise_for_status()
     except (httpx.HTTPError, httpx.TooManyRedirects) as exc:

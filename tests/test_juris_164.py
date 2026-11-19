@@ -1113,6 +1113,94 @@ dicta la siguiente sentencia.
         self.assertEqual(len(attempted), 2)
         self.assertIn("secretaria", attempted[1])
 
+    def test_tc_exact_number_uses_official_decision_page_after_all_search_routes_reject(self):
+        class FakeResponse:
+            status_code = 406
+
+            def __init__(self, url):
+                self.url = httpx.URL(url)
+
+        class FakeClient:
+            def __init__(self, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+            async def get(self, url, params):
+                return FakeResponse(url)
+
+        page_url = (
+            "https://www.tribunalconstitucional.gob.do/consultas/"
+            "secretar%C3%ADa/sentencias/tc001924"
+        )
+        pdf_url = (
+            "https://tribunalsitestorage.blob.core.windows.net/media/53968/"
+            "tc-0019-24-tc-04-2023-0274.pdf"
+        )
+        page_html = (
+            "<html><h1>Detalle sentencia TC/0019/24</h1>"
+            f'<a href="{pdf_url}">Descargar</a></html>'
+        )
+        direct_document = {
+            "final_url": page_url,
+            "content_type": "text/html",
+            "data": page_html.encode(),
+            "text_response": page_html,
+        }
+
+        with patch("app.httpx.AsyncClient", FakeClient), patch(
+            "app.fetch_document", new=AsyncMock(return_value=direct_document)
+        ) as fetch:
+            result = asyncio.run(search_tc_decisions("TC/0019/24", None, 3))
+
+        self.assertEqual(result["status"], "CANDIDATES_FOUND")
+        self.assertEqual(len(result["attempted_official_statuses"]), 3)
+        self.assertTrue(all(
+            attempt["http_status"] == 406
+            for attempt in result["attempted_official_statuses"]
+        ))
+        self.assertEqual(result["results"][0]["decision_number"], "TC/0019/24")
+        self.assertEqual(result["results"][0]["source_url"], pdf_url)
+        self.assertEqual(result["results"][0]["official_page_url"], page_url)
+        self.assertFalse(result["results"][0]["official_document_verified"])
+        self.assertFalse(result["results"][0]["ratio_decidendi_verified"])
+        fetch.assert_awaited_once_with(page_url)
+
+    def test_tc_topic_search_failure_does_not_claim_no_results_or_guess_a_number(self):
+        class FakeResponse:
+            status_code = 406
+
+            def __init__(self, url):
+                self.url = httpx.URL(url)
+
+        class FakeClient:
+            def __init__(self, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+            async def get(self, url, params):
+                return FakeResponse(url)
+
+        with patch("app.httpx.AsyncClient", FakeClient), patch(
+            "app.fetch_document", new=AsyncMock()
+        ) as fetch:
+            result = asyncio.run(search_tc_decisions("debido proceso", None, 3))
+
+        self.assertEqual(result["status"], "ACCESS_FAILED")
+        self.assertEqual(result["results"], [])
+        self.assertIsNone(result["direct_number_lookup"])
+        self.assertIn("rechazaron", result["message"])
+        fetch.assert_not_awaited()
+
     def test_scj_ranking_marks_filters_and_relevance_unverified(self):
         candidates = [
             {"decision_number": "SCJ-PS-22-1231", "tribunal": "PRIMERA SALA",
