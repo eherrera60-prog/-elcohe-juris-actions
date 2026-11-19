@@ -18,6 +18,10 @@ MAX_REDIRECTS = 3
 MAX_OFFICIAL_REQUEST_ATTEMPTS = 3
 RETRYABLE_OFFICIAL_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
 TC_SEARCH_URL = "https://www.tribunalconstitucional.gob.do/consultas/secretar%C3%ADa/sentencias/"
+TC_SEARCH_URL_FALLBACKS = (
+    "https://www.tribunalconstitucional.gob.do/consultas/secretaria/sentencias/",
+    "https://www.tribunalconstitucional.gob.do/consultas/sentencias/",
+)
 SCJ_PORTAL_URL = "https://consultasentenciascj.poderjudicial.gob.do/"
 SCJ_ID_SEPARATOR = r"(?:[ \t\r\n]{0,12}[-\u00ad\u2010-\u2014\u2212][ \t\r\n]{0,12}|[ \t\r\n]{1,12})"
 SCJ_IDENTIFIER_SOURCE = (
@@ -915,9 +919,26 @@ async def _search_tc_candidates(q: str, year: int | None, limit: int) -> dict:
             headers=headers,
             trust_env=False,
         ) as client:
-            response = await official_request(
-                client, "get", TC_SEARCH_URL, params=params
-            )
+            response = None
+            attempted_urls = []
+            for route in (TC_SEARCH_URL,) + TC_SEARCH_URL_FALLBACKS:
+                attempted_urls.append(route)
+                candidate_response = await official_request(
+                    client, "get", route, params=params
+                )
+                if candidate_response.status_code not in (406, 404, 410, 421):
+                    response = candidate_response
+                    break
+            if response is None:
+                return {
+                    "query": search_term,
+                    "search_executed": False,
+                    "results": [],
+                    "status": "ACCESS_FAILED",
+                    "message": "Las rutas oficiales del TC rechazaron o no resolvieron la consulta.",
+                    "http_status": 406,
+                    "attempted_official_urls": attempted_urls,
+                }
             response.raise_for_status()
     except (httpx.HTTPError, httpx.TooManyRedirects) as exc:
         return {"query": search_term, "search_executed": False,

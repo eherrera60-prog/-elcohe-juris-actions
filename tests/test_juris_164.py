@@ -23,6 +23,7 @@ from app import (
 from juris_164 import (
     _scj_archive_candidates,
     _scj_candidates,
+    _rank_scj_candidates,
     _search_scj_official_archive,
     search_scj_candidates,
 )
@@ -1062,6 +1063,79 @@ dicta la siguiente sentencia.
         self.assertFalse(client_options["trust_env"])
         self.assertEqual(request_params["filtery"], "")
         self.assertEqual(request_params["criteriay"], "")
+
+    def test_tc_search_falls_back_after_official_406(self):
+        class FakeResponse:
+            headers = {"content-type": "text/html; charset=utf-8"}
+            url = httpx.URL(
+                "https://www.tribunalconstitucional.gob.do/consultas/secretaria/sentencias/"
+            )
+            text = (
+                '<input id="searchString" value="TC/0019/24">'
+                '<article><a href="/consultas/secretaría/sentencias/tc001924">'
+                'TC/0019/24</a></article>'
+            )
+
+            def __init__(self, status_code):
+                self.status_code = status_code
+
+            def raise_for_status(self):
+                if self.status_code >= 400:
+                    raise httpx.HTTPStatusError(
+                        "HTTP error",
+                        request=httpx.Request("GET", str(self.url)),
+                        response=httpx.Response(self.status_code, request=httpx.Request("GET", str(self.url))),
+                    )
+
+        attempted = []
+
+        class FakeClient:
+            def __init__(self, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+            async def get(self, url, params):
+                attempted.append(url)
+                if len(attempted) == 1:
+                    return FakeResponse(406)
+                return FakeResponse(200)
+
+        with patch("app.httpx.AsyncClient", FakeClient):
+            result = asyncio.run(search_tc_decisions("TC/0019/24", None, 3))
+
+        self.assertEqual(result["status"], "CANDIDATES_FOUND")
+        self.assertEqual(result["results"][0]["decision_number"], "TC/0019/24")
+        self.assertEqual(len(attempted), 2)
+        self.assertIn("secretaria", attempted[1])
+
+    def test_scj_ranking_marks_filters_and_relevance_unverified(self):
+        candidates = [
+            {"decision_number": "SCJ-PS-22-1231", "tribunal": "PRIMERA SALA",
+             "date": "2022-04-29T00:00:00"},
+            {"decision_number": "SCJ-SS-22-9999", "tribunal": "SEGUNDA SALA",
+             "date": "2024-03-04T00:00:00"},
+        ]
+        ranked = _rank_scj_candidates(
+            candidates,
+            "responsabilidad civil",
+            "Primera Sala",
+            "Civil",
+            2020,
+            2026,
+        )
+        self.assertEqual(ranked[0]["decision_number"], "SCJ-PS-22-1231")
+        self.assertEqual(ranked[0]["metadata_relevance"]["chamber_match"], True)
+        self.assertEqual(ranked[0]["metadata_relevance"]["matter_match"], None)
+        self.assertEqual(ranked[0]["metadata_relevance"]["year_match"], True)
+        for candidate in ranked:
+            self.assertEqual(candidate["relevance_status"], "NOT_VERIFIED")
+            self.assertFalse(candidate["legal_relevance_verified"])
+            self.assertTrue(candidate["relevance_review_required"])
 
     def test_tc_legacy_adapter_preserves_integrated_search_status(self):
         class FakeResponse:

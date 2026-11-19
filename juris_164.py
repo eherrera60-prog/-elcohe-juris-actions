@@ -99,6 +99,67 @@ def _official_document_url(value: object, allowed_host) -> str | None:
     return None
 
 
+def _rank_scj_candidates(
+    candidates: list[dict],
+    query: str,
+    chamber: str | None,
+    matter: str | None,
+    year_from: int | None,
+    year_to: int | None,
+) -> list[dict]:
+    """Rank metadata matches without treating ranking as documentary verification."""
+    import re
+    from app import fold
+
+    query_terms = set(re.findall(r"[a-z0-9]{3,}", fold(query)))
+
+    def date_in_range(candidate: dict) -> bool | None:
+        value = candidate.get("date")
+        if not isinstance(value, str) or not re.match(r"^(\d{4})-", value):
+            return None
+        year = int(value[:4])
+        if year_from is not None and year_to is not None:
+            return year_from <= year <= year_to
+        return None
+
+    ranked = []
+    for candidate in candidates:
+        metadata = " ".join(
+            str(candidate.get(field, ""))
+            for field in ("decision_number", "tribunal", "case_number", "date")
+        )
+        metadata_terms = set(re.findall(r"[a-z0-9]{3,}", fold(metadata)))
+        lexical_overlap = len(query_terms & metadata_terms)
+        chamber_match = None
+        if chamber:
+            tribunal = fold(str(candidate.get("tribunal", "")))
+            chamber_match = fold(chamber) in tribunal
+        year_match = date_in_range(candidate)
+
+        item = dict(candidate)
+        item["relevance_status"] = "NOT_VERIFIED"
+        item["legal_relevance_verified"] = False
+        item["relevance_review_required"] = True
+        item["metadata_relevance"] = {
+            "lexical_overlap_terms": lexical_overlap,
+            "chamber_match": chamber_match,
+            "matter_match": None,
+            "year_match": year_match,
+            "verified_by_document": False,
+        }
+        ranked.append(item)
+
+    ranked.sort(
+        key=lambda item: (
+            item["metadata_relevance"]["chamber_match"] is True,
+            item["metadata_relevance"]["year_match"] is True,
+            item["metadata_relevance"]["lexical_overlap_terms"],
+        ),
+        reverse=True,
+    )
+    return ranked
+
+
 def _scj_candidates(payload: object, allowed_host) -> tuple[list[dict], int] | None:
     from app import canonical_scj_identifier
 
@@ -790,6 +851,14 @@ async def search_scj_candidates(
                 reported_count += count
                 if not candidates and (count > 0 or payload["data"]):
                     unparsed_results = True
+                candidates = _rank_scj_candidates(
+                    candidates,
+                    normalized_query,
+                    chamber,
+                    matter,
+                    year_from,
+                    year_to,
+                )
                 for candidate in candidates:
                     if candidate not in results:
                         results.append(candidate)
