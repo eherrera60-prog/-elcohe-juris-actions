@@ -242,6 +242,8 @@ async def portal(request: Request):
         "<h1>ELCOHE-JURIS RD 1.6.5</h1>"
         "<p>Acceso autorizado al portal.</p>"
         "<p>Sesión jurisprudencial activa.</p>"
+        "<p><a href='/portal/validation'>"
+        "Validación funcional</a></p>"
         "<form method='post' action='/auth/logout'>"
         f"<input type='hidden' name='csrf' value='{csrf}'>"
         "<button>Cerrar sesión</button></form></html>",

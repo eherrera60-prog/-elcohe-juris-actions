@@ -218,7 +218,7 @@ def decode_access_token(token: str) -> dict:
         signing_key = _jwks_client(jwks_url).get_signing_key_from_jwt(token).key
     except jwt.PyJWKClientConnectionError as exc:
         raise HTTPException(503, "No se pudo consultar las claves públicas del proveedor de identidad.") from exc
-    except jwt.PyJWKClientError as exc:
+    except (jwt.PyJWKClientError, jwt.InvalidTokenError) as exc:
         raise HTTPException(401, "Token OAuth inválido.") from exc
     try:
         claims = jwt.decode(
@@ -262,6 +262,8 @@ async def require_active_user(
         ("GET", "/auth/callback"),
         ("GET", "/portal"),
         ("POST", "/auth/logout"),
+        ("GET", "/portal/validation"),
+        ("POST", "/portal/validation"),
     }:
         return {"sub": None, "role": "public"}
     if request.url.path == "/health":
