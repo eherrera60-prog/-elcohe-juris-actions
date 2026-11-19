@@ -13,7 +13,10 @@ operaciones `/v1/*` ni sustituye sus controles de autorización.
 
 ## Búsqueda y verificación
 
-- `GET /v1/tc/search`: localiza enlaces candidatos en el portal oficial del TC.
+- `GET /v1/tc/search`: busca en un índice externo limitado a dominios oficiales
+  del TC y consulta aparte referencias previamente verificadas.
+- `POST /v1/registry/tc-references`: verifica y conserva una referencia PDF del
+  TC; es una operación administrativa y no se publica en OpenAPI.
 - `GET /v1/scj/search`: consulta el buscador oficial de decisiones de la SCJ.
 - `GET /v1/scj/search-plan`: prepara términos de búsqueda; no consulta el portal
   ni devuelve resultados.
@@ -40,22 +43,40 @@ Las búsquedas usan estos estados:
 - `EXTRACTION_FAILED`: hubo respuesta, pero no se pudo validar la consulta, sus
   filtros o la estructura de resultados.
 - `ACCESS_FAILED`: no se completó el acceso a la fuente oficial.
+- `INDEX_SEARCH_NOT_CONFIGURED` / `INDEX_SEARCH_ACCESS_FAILED`: la búsqueda
+  indexada no tiene clave configurada o el proveedor no completó la consulta.
+- `NO_INDEX_RESULTS`: el índice no devolvió candidatos TC; no confirma que no
+  existan sentencias.
 
 La búsqueda SCJ usa el formulario público y el endpoint DataTables publicado
 por el portal. Sala, materia y año se traducen a los valores vigentes del
 formulario; los rangos de años se consultan por año y se limitan a diez años.
 El archivo institucional alternativo no aplica esos filtros y su estado se
-informa aparte. En el TC, la consulta confirma el término y el año reflejados
-por la página oficial. Los números, fechas, tribunales y enlaces se devuelven
-solo cuando aparecen en los datos de la fuente. Un HTTP 200 por sí solo no
-confirma una búsqueda satisfactoria.
+informa aparte. La búsqueda TC distingue la consulta indexada de las
+referencias persistentes y no consulta las rutas de búsqueda TC que respondían
+HTTP 406.
 
-Si las rutas de búsqueda del TC son rechazadas y la consulta contiene un número
-exacto, se intenta la ficha pública de esa sentencia y el PDF oficial que esta
-enlace. Ese resultado sigue siendo un candidato hasta verificar el PDF. No se
-confirma ausencia de sentencias ni se realiza indexación masiva propia; si falla
-la búsqueda temática oficial, el error de acceso se informa sin inventar
-resultados.
+La búsqueda TC no vuelve a llamar las rutas que respondieron HTTP 406. Usa la
+API de Brave Search como índice externo, con la consulta restringida a
+`tribunalconstitucional.gob.do` y
+`tribunalsitestorage.blob.core.windows.net`; además, descarta cualquier
+resultado cuyo URL no pertenezca a esos dominios. Configura
+`BRAVE_SEARCH_API_KEY` en el servicio para habilitar la búsqueda indexada. Si
+falta la clave o el proveedor falla, el API informa el estado explícito y no
+afirma que no existan sentencias. Las consultas se envían a ese proveedor;
+revisa sus condiciones y tarifas antes de configurar la clave.
+
+`/v1/tc/search` separa los resultados indexados de los documentos previamente
+verificados. No realiza una búsqueda en tiempo real en las rutas TC rechazadas.
+Los resultados indexados son solo candidatos. Para conservar uno, envía el URL
+PDF oficial y el número esperado a `POST /v1/registry/tc-references` como
+administrador. Si el resultado es una ficha HTML, usa primero
+`POST /v1/resolve-official-pdf` para localizar el enlace PDF candidato. El
+servicio vuelve a descargar el PDF y verifica origen,
+integridad SHA-256, tribunal, número, extracción de texto y cantidad de páginas
+antes de guardarlo en el registro persistente existente. La clave única por
+tribunal, número y huella evita duplicados; la operación deja la revisión
+humana pendiente y nunca certifica automáticamente la ratio decidendi.
 
 Los resultados SCJ incluyen `source_url` y `decision_number` como entradas
 directas para `verifyOfficialPdf`; este número se normaliza al identificador

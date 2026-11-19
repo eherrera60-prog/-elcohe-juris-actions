@@ -1249,7 +1249,6 @@ async def _search_tc_candidates(q: str, year: int | None, limit: int) -> dict:
             "status": status, "message": message}
 
 
-@app.get("/v1/tc/search", operation_id="searchTcDecisions")
 async def search_tc_decisions(
     q: str = Query(min_length=2),
     year: int | None = None,
@@ -1264,6 +1263,70 @@ async def search_tc(q: str, year: int | None = None, limit: int = 10) -> dict:
     if result["status"] == "CANDIDATES_FOUND":
         result["status"] = "LOCATED_RESULTS"
     return result
+
+
+@app.get("/v1/tc/search", operation_id="searchTcDecisions")
+async def search_tc_recovery(
+    q: str = Query(min_length=2, max_length=240),
+    year: int | None = Query(default=None, ge=2012, le=2100),
+    limit: int = Query(default=10, ge=1, le=20),
+):
+    query = normalize_space(q)
+    if len(query) < 2:
+        raise HTTPException(422, "q debe contener al menos dos caracteres no blancos.")
+    from registry import find_verified_tc_references
+    from tc_indexed_recovery import search_tc_index
+
+    indexed = await search_tc_index(query, year, limit)
+    verified = find_verified_tc_references(query, limit)
+    if year is not None:
+        verified = [
+            item for item in verified
+            if item.get("decision_number", "").endswith(f"/{year % 100:02d}")
+        ]
+    index_results = indexed.get("results", [])
+    if index_results:
+        status = "CANDIDATES_FOUND"
+        message = indexed["message"]
+    elif verified:
+        status = "VERIFIED_DOCUMENTS_FOUND"
+        message = "Se encontraron documentos TC verificados previamente en el registro persistente."
+    else:
+        status = indexed["status"]
+        message = indexed["message"]
+
+    return {
+        "query": query,
+        "status": status,
+        "search_executed": indexed.get("search_executed", False),
+        "results": index_results,
+        "verified_documents": verified,
+        "search_modes": {
+            "real_time_official": {
+                "status": "NOT_RUN",
+                "reason": (
+                    "No se repiten las rutas de búsqueda TC que ya respondieron "
+                    "HTTP 406; la ficha en línea tampoco se consulta como buscador."
+                ),
+            },
+            "indexed_search": {
+                "status": indexed["status"],
+                "provider": indexed.get("provider"),
+                "scoped_domains": indexed.get("scoped_domains", []),
+                "result_count": len(index_results),
+            },
+            "previously_verified_documents": {
+                "status": "FOUND" if verified else "NO_MATCH",
+                "result_count": len(verified),
+            },
+        },
+        "message": message,
+        "note": (
+            "Los resultados del índice son candidatos. Las referencias persistentes "
+            "tienen PDF, fuente, identidad, texto, páginas y huella verificados; "
+            "ningún estado certifica automáticamente la ratio decidendi."
+        ),
+    }
 
 
 @app.get("/v1/scj/search-plan", operation_id="prepareScjSearch")
