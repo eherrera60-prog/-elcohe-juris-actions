@@ -52,24 +52,28 @@ La búsqueda SCJ usa el formulario público y el endpoint DataTables publicado
 por el portal. Sala, materia y año se traducen a los valores vigentes del
 formulario; los rangos de años se consultan por año y se limitan a diez años.
 El archivo institucional alternativo no aplica esos filtros y su estado se
-informa aparte. La búsqueda TC distingue la consulta indexada de las
-referencias persistentes y no consulta las rutas de búsqueda TC que respondían
-HTTP 406.
+informa aparte. En el TC, la ruta oficial principal se consulta una sola vez en
+tiempo real; los resultados oficiales, indexados y previamente verificados se
+informan por separado. Tras HTTP 406 no se llaman las rutas alternativas ya
+rechazadas.
 
-La búsqueda TC no vuelve a llamar las rutas que respondieron HTTP 406. Usa la
-API de Brave Search como índice externo, con la consulta restringida a
+La búsqueda TC consulta primero una sola ruta oficial en tiempo real; si recibe
+HTTP 406 no reintenta ni llama las rutas alternativas ya rechazadas. Si la
+búsqueda oficial no localiza candidatos, Brave Search puede usarse como respaldo
+opcional cuando `BRAVE_SEARCH_API_KEY` esté configurada. La API de Brave Search
+envía la consulta al índice externo, restringida a
 `tribunalconstitucional.gob.do` y
 `tribunalsitestorage.blob.core.windows.net`; además, descarta cualquier
 resultado cuyo URL no pertenezca a esos dominios. Configura
-`BRAVE_SEARCH_API_KEY` en el servicio para habilitar la búsqueda indexada. Si
-falta la clave o el proveedor falla, el API informa el estado explícito y no
-afirma que no existan sentencias. Las consultas se envían a ese proveedor;
-revisa sus condiciones y tarifas antes de configurar la clave.
+`BRAVE_SEARCH_API_KEY` en el servicio para habilitar ese respaldo. Si falta la
+clave o el proveedor falla, la búsqueda oficial continúa disponible y el API
+informa el estado del índice por separado; no afirma que no existan sentencias.
+Revisa las condiciones y tarifas antes de configurar la clave.
 
-`/v1/tc/search` separa los resultados indexados de los documentos previamente
-verificados. No realiza una búsqueda en tiempo real en las rutas TC rechazadas.
-Los resultados indexados son solo candidatos. Para conservar uno, envía el URL
-PDF oficial y el número esperado a `POST /v1/registry/tc-references` como
+`/v1/tc/search` separa los resultados oficiales en tiempo real, los indexados y
+los documentos previamente verificados. Los resultados de búsqueda son
+candidatos, no documentos verificados. Para conservar uno, envía el URL PDF
+oficial y el número esperado a `POST /v1/registry/tc-references` como
 administrador. Si el resultado es una ficha HTML, usa primero
 `POST /v1/resolve-official-pdf` para localizar el enlace PDF candidato. El
 servicio vuelve a descargar el PDF y verifica origen,

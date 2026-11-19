@@ -1005,7 +1005,13 @@ async def _tc_direct_number_candidate(
     }
 
 
-async def _search_tc_candidates(q: str, year: int | None, limit: int) -> dict:
+async def _search_tc_candidates(
+    q: str,
+    year: int | None,
+    limit: int,
+    *,
+    primary_only: bool = False,
+) -> dict:
     """Locate candidates on the official TC portal; never certify a holding here."""
     # The official TC form filters years separately; appending the year to
     # searchString changes the query and does not activate the year filter.
@@ -1031,7 +1037,7 @@ async def _search_tc_candidates(q: str, year: int | None, limit: int) -> dict:
     try:
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(90.0, connect=10.0),
-            follow_redirects=True,
+            follow_redirects=not primary_only,
             max_redirects=MAX_REDIRECTS,
             headers=headers,
             trust_env=False,
@@ -1039,7 +1045,12 @@ async def _search_tc_candidates(q: str, year: int | None, limit: int) -> dict:
             response = None
             attempted_urls = []
             attempted_statuses = []
-            for route in (TC_SEARCH_URL,) + TC_SEARCH_URL_FALLBACKS:
+            routes = (
+                (TC_SEARCH_URL,)
+                if primary_only
+                else (TC_SEARCH_URL,) + TC_SEARCH_URL_FALLBACKS
+            )
+            for route in routes:
                 attempted_urls.append(route)
                 candidate_response = await official_request(
                     client, "get", route, params=params
@@ -1054,7 +1065,7 @@ async def _search_tc_candidates(q: str, year: int | None, limit: int) -> dict:
             if response is None:
                 direct_lookup = (
                     await _tc_direct_number_candidate(number_parts)
-                    if number_parts else None
+                    if number_parts and not primary_only else None
                 )
                 direct_results = (
                     direct_lookup.get("results", [])
@@ -1067,7 +1078,7 @@ async def _search_tc_candidates(q: str, year: int | None, limit: int) -> dict:
                 )
                 return {
                     "query": search_term,
-                    "search_executed": False,
+                    "search_executed": bool(attempted_statuses),
                     "results": direct_results,
                     "status": (
                         "CANDIDATES_FOUND" if direct_succeeded
@@ -1081,7 +1092,11 @@ async def _search_tc_candidates(q: str, year: int | None, limit: int) -> dict:
                         )
                         if direct_succeeded
                         else (
-                            "Las rutas oficiales del TC rechazaron o no resolvieron la consulta."
+                            (
+                                "La ruta oficial del TC rechazó o no resolvió la consulta."
+                                if primary_only else
+                                "Las rutas oficiales del TC rechazaron o no resolvieron la consulta."
+                            )
                             if direct_lookup is None
                             else (
                                 "El buscador oficial rechazó la consulta y la ficha "
@@ -1109,7 +1124,9 @@ async def _search_tc_candidates(q: str, year: int | None, limit: int) -> dict:
                 if isinstance(exc, httpx.HTTPStatusError) else None}
 
     final_url = str(response.url)
-    if not allowed_host(response.url.host):
+    from tc_indexed_recovery import is_official_tc_host, official_tc_url
+
+    if not is_official_tc_host(response.url.host):
         return {"query": search_term, "search_executed": False,
                 "results": [], "status": "ACCESS_FAILED",
                 "message": "La consulta redirigió fuera de los dominios oficiales permitidos."}
@@ -1158,10 +1175,10 @@ async def _search_tc_candidates(q: str, year: int | None, limit: int) -> dict:
     expected = re.sub(r"\s+", "", exact.group(0)).upper() if exact else None
     results, seen = [], set()
     for anchor in soup.find_all("a", href=True):
-        href = urljoin(final_url, anchor.get("href", ""))
-        parsed = urlparse(href)
-        if parsed.scheme != "https" or not allowed_host(parsed.hostname):
+        href = official_tc_url(urljoin(final_url, anchor.get("href", "")))
+        if href is None:
             continue
+        parsed = urlparse(href)
         if parsed.path.rstrip("/") == urlparse(TC_SEARCH_URL).path.rstrip("/"):
             continue
         # Search link text, title and nearby result-card text. Never treat a
@@ -1212,6 +1229,8 @@ async def _search_tc_candidates(q: str, year: int | None, limit: int) -> dict:
             "passage_status": "NOT_VERIFIED",
             "official_document_verified": False,
             "ratio_decidendi_verified": False,
+            "retrieval_mode": "REAL_TIME_OFFICIAL_SEARCH",
+            "search_source": "OFFICIAL_TC_PORTAL",
         }
         tribunal = re.search(
             r"\bTribunal Constitucional(?: de la República Dominicana)?\b",
@@ -1277,43 +1296,67 @@ async def search_tc_recovery(
     from registry import find_verified_tc_references
     from tc_indexed_recovery import search_tc_index
 
-    indexed = await search_tc_index(query, year, limit)
+    official = await _search_tc_candidates(
+        query, year, limit, primary_only=True
+    )
+    official_results = official.get("results", [])
+    if official_results:
+        indexed = {
+            "status": "NOT_RUN",
+            "provider": "BRAVE_SEARCH_INDEX",
+            "search_executed": False,
+            "results": [],
+            "message": "No se llamó al índice externo porque la búsqueda oficial devolvió candidatos.",
+        }
+        results = official_results
+        status = "CANDIDATES_FOUND"
+        message = official["message"]
+    else:
+        indexed = await search_tc_index(query, year, limit)
+        results = indexed.get("results", [])
+        if results:
+            status = "CANDIDATES_FOUND"
+            message = indexed["message"]
+        elif official.get("status") == "NO_RESULTS_CONFIRMED":
+            status = "NO_RESULTS_CONFIRMED"
+            message = official["message"]
+        else:
+            status = official.get("status", "ACCESS_FAILED")
+            message = official.get("message", indexed["message"])
     verified = find_verified_tc_references(query, limit)
     if year is not None:
         verified = [
             item for item in verified
             if item.get("decision_number", "").endswith(f"/{year % 100:02d}")
         ]
-    index_results = indexed.get("results", [])
-    if index_results:
-        status = "CANDIDATES_FOUND"
-        message = indexed["message"]
-    elif verified:
+    if not results and verified:
         status = "VERIFIED_DOCUMENTS_FOUND"
         message = "Se encontraron documentos TC verificados previamente en el registro persistente."
-    else:
-        status = indexed["status"]
-        message = indexed["message"]
 
     return {
         "query": query,
         "status": status,
-        "search_executed": indexed.get("search_executed", False),
-        "results": index_results,
+        "search_executed": (
+            official.get("search_executed", False)
+            or indexed.get("search_executed", False)
+        ),
+        "results": results,
         "verified_documents": verified,
         "search_modes": {
             "real_time_official": {
-                "status": "NOT_RUN",
+                "status": official.get("status", "ACCESS_FAILED"),
+                "http_status": official.get("http_status"),
+                "result_count": len(official_results),
                 "reason": (
-                    "No se repiten las rutas de búsqueda TC que ya respondieron "
-                    "HTTP 406; la ficha en línea tampoco se consulta como buscador."
+                    "Se consulta una sola vez la ruta oficial principal; si devuelve "
+                    "HTTP 406 no se llaman las rutas de búsqueda alternativas ya rechazadas."
                 ),
             },
             "indexed_search": {
                 "status": indexed["status"],
                 "provider": indexed.get("provider"),
                 "scoped_domains": indexed.get("scoped_domains", []),
-                "result_count": len(index_results),
+                "result_count": len(indexed.get("results", [])),
             },
             "previously_verified_documents": {
                 "status": "FOUND" if verified else "NO_MATCH",

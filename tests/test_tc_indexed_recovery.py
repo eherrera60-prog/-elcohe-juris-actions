@@ -150,6 +150,15 @@ def test_tc_search_separates_index_candidates_from_previously_verified_documents
     app.dependency_overrides[require_active_user] = lambda: {"sub": "tester"}
     try:
         with patch(
+            "app._search_tc_candidates",
+            new=AsyncMock(return_value={
+                "status": "ACCESS_FAILED",
+                "search_executed": True,
+                "http_status": 406,
+                "results": [],
+                "message": "La búsqueda oficial respondió HTTP 406.",
+            }),
+        ) as official_search, patch(
             "tc_indexed_recovery.search_tc_index",
             new=AsyncMock(return_value=index_result),
         ) as indexed_search, patch(
@@ -162,14 +171,93 @@ def test_tc_search_separates_index_candidates_from_previously_verified_documents
 
     assert response.status_code == 200
     body = response.json()
-    assert body["search_modes"]["real_time_official"]["status"] == "NOT_RUN"
+    assert body["search_modes"]["real_time_official"]["status"] == "ACCESS_FAILED"
+    assert body["search_modes"]["real_time_official"]["http_status"] == 406
     assert body["search_modes"]["indexed_search"]["status"] == "CANDIDATES_FOUND"
     assert body["search_modes"]["previously_verified_documents"]["result_count"] == 1
     assert body["results"][0]["retrieval_mode"] == "INDEXED_OFFICIAL_SEARCH"
     assert body["verified_documents"][0]["retrieval_mode"] == "PREVIOUSLY_VERIFIED_DOCUMENT"
     assert body["verified_documents"][0]["ratio_decidendi_verified"] is False
+    official_search.assert_awaited_once_with(
+        query, None, 10, primary_only=True
+    )
     indexed_search.assert_awaited_once_with(query, None, 10)
     stored_search.assert_called_once_with(query, 10)
+
+
+def test_tc_search_does_not_call_index_when_official_search_finds_candidates():
+    official = {
+        "status": "CANDIDATES_FOUND",
+        "search_executed": True,
+        "results": [{
+            "decision_number": "TC/0019/24",
+            "source_url": "https://tribunalsitestorage.blob.core.windows.net/media/tc-0019-24.pdf",
+            "retrieval_mode": "REAL_TIME_OFFICIAL_SEARCH",
+        }],
+        "message": "Fuente oficial.",
+    }
+    app.dependency_overrides[require_active_user] = lambda: {"sub": "tester"}
+    try:
+        with patch(
+            "app._search_tc_candidates",
+            new=AsyncMock(return_value=official),
+        ), patch(
+            "tc_indexed_recovery.search_tc_index",
+            new=AsyncMock(side_effect=AssertionError("índice no debe consultarse")),
+        ) as indexed_search, patch(
+            "registry.find_verified_tc_references",
+            return_value=[],
+        ):
+            response = TestClient(app).get(
+                "/v1/tc/search", params={"q": "TC/0019/24"}
+            )
+    finally:
+        app.dependency_overrides.pop(require_active_user, None)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["results"][0]["retrieval_mode"] == "REAL_TIME_OFFICIAL_SEARCH"
+    assert body["search_modes"]["indexed_search"]["status"] == "NOT_RUN"
+    indexed_search.assert_not_awaited()
+
+
+def test_tc_primary_official_search_does_not_repeat_rejected_alternative_routes():
+    from app import _search_tc_candidates
+
+    attempted = []
+    client_options = {}
+
+    class FakeResponse:
+        status_code = 406
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            client_options.update(kwargs)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, url, params):
+            attempted.append(str(url))
+            return FakeResponse()
+
+    with patch("app.httpx.AsyncClient", FakeClient), patch(
+        "app.fetch_document", new=AsyncMock()
+    ) as fetch:
+        result = asyncio.run(
+            _search_tc_candidates(
+                "debido proceso", None, 5, primary_only=True
+            )
+        )
+
+    assert result["status"] == "ACCESS_FAILED"
+    assert result["http_status"] == 406
+    assert len(attempted) == 1
+    assert fetch.await_count == 0
+    assert client_options["follow_redirects"] is False
 
 
 def test_tc_reference_registration_remains_admin_only_and_hidden_from_openapi():
