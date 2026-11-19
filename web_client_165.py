@@ -6,7 +6,7 @@ import hashlib
 import os
 import secrets
 import time
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 import httpx
 
@@ -25,7 +25,6 @@ from auth_access import (
 router = APIRouter()
 
 BASE = "https://elcohe-juris-165-produccion.onrender.com"
-CALLBACK = BASE + "/auth/callback"
 COOKIE = "__Host-elcohe-session"
 FLOW_COOKIE = "__Host-elcohe-oauth"
 
@@ -90,6 +89,26 @@ def redirect(url):
     return RedirectResponse(url, status_code=303, headers=HEADERS)
 
 
+def _callback_url():
+    base = os.getenv("RENDER_EXTERNAL_URL", BASE).strip()
+    try:
+        parsed = urlparse(base)
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path not in ("", "/")
+            or parsed.query
+            or parsed.fragment
+            or parsed.port not in (None, 443)
+        ):
+            raise HTTPException(503, "URL pública del servicio no válida.")
+    except ValueError as exc:
+        raise HTTPException(503, "URL pública del servicio no válida.") from exc
+    return base.rstrip("/") + "/auth/callback"
+
+
 @router.get("/auth/login", include_in_schema=False)
 async def login(request: Request):
     client, _, audience = configuration()
@@ -115,7 +134,7 @@ async def login(request: Request):
     params = {
         "response_type": "code",
         "client_id": client,
-        "redirect_uri": CALLBACK,
+        "redirect_uri": _callback_url(),
         "audience": audience,
         "scope": REQUIRED_PERMISSION,
         "state": state,
@@ -162,7 +181,7 @@ async def callback(request: Request):
                     "client_id": client,
                     "client_secret": secret,
                     "code": code,
-                    "redirect_uri": CALLBACK,
+                    "redirect_uri": _callback_url(),
                     "code_verifier": flow["verifier"],
                 },
             )
