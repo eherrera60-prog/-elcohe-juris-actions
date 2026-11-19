@@ -1395,5 +1395,6 @@ app.openapi = _openapi_schema
 
 # Portal OAuth independiente de las operaciones jurisprudenciales.
 from web_client_165 import router as web_client_router
-import portal_validation_165
+from portal_validation_165 import router as portal_validation_router
 app.include_router(web_client_router)
+app.include_router(portal_validation_router)

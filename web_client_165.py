@@ -89,6 +89,11 @@ def redirect(url):
     return RedirectResponse(url, status_code=303, headers=HEADERS)
 
 
+@router.get("/", include_in_schema=False)
+async def home():
+    return redirect("/portal")
+
+
 def _callback_url():
     base = os.getenv("RENDER_EXTERNAL_URL", BASE).strip()
     try:

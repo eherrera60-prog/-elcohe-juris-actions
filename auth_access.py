@@ -261,6 +261,7 @@ async def require_active_user(
     token: str | None = Security(oauth2_scheme, scopes=[REQUIRED_PERMISSION]),
 ) -> dict:
     if token is None and (request.method, request.url.path) in {
+        ("GET", "/"),
         ("GET", "/auth/login"),
         ("GET", "/auth/callback"),
         ("GET", "/portal"),

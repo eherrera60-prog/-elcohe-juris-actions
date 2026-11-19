@@ -4,6 +4,13 @@ Backend de acciones para búsqueda y verificación jurisprudencial de la Suprema
 Corte de Justicia (SCJ) y el Tribunal Constitucional (TC) de la República
 Dominicana.
 
+## Portal de acceso
+
+La ruta `/` redirige al portal `/portal`. Desde allí se inicia la sesión OAuth
+en `/auth/login`; la validación funcional está disponible en
+`/portal/validation` únicamente con una sesión activa. El portal no expone las
+operaciones `/v1/*` ni sustituye sus controles de autorización.
+
 ## Búsqueda y verificación
 
 - `GET /v1/tc/search`: localiza enlaces candidatos en el portal oficial del TC.

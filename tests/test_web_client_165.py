@@ -1,24 +1,83 @@
 
 import os
 from urllib.parse import parse_qs, urlparse
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from app import app
 import web_client_165
-from auth_access import AUTH0_AUDIENCE
+import portal_validation_165
+from auth_access import AUTH0_AUDIENCE, require_active_user
 
 client = TestClient(
     app, base_url="https://testserver"
 )
 
 
+def test_root_redirects_to_public_portal():
+    response = client.get("/", follow_redirects=False)
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/portal"
+
+
 def test_web_portal_public():
     r = client.get("/portal")
     assert r.status_code == 200
     assert "Iniciar sesión" in r.text
+
+
+def test_portal_validation_get_route_is_registered_and_requires_a_session():
+    with patch(
+        "portal_validation_165.active_session",
+        new=AsyncMock(return_value={"csrf": "test-csrf"}),
+    ):
+        response = client.get("/portal/validation")
+
+    assert response.status_code == 200
+    assert "Validación funcional" in response.text
+    assert "value='test-csrf'" in response.text
+
+
+def test_portal_validation_executes_authorized_database_check():
+    session = {"csrf": "test-csrf", "token": "test-token"}
+    app.dependency_overrides[require_active_user] = lambda: {
+        "sub": "test-admin",
+        "role": "admin",
+    }
+    try:
+        with patch(
+            "portal_validation_165.active_session",
+            new=AsyncMock(return_value=session),
+        ), patch(
+            "auth_access.check_database_connection",
+            return_value={"status": "DATABASE_CONNECTED"},
+        ):
+            response = client.post(
+                "/portal/validation",
+                data={"csrf": "test-csrf", "operation": "database"},
+            )
+    finally:
+        app.dependency_overrides.pop(require_active_user, None)
+
+    assert response.status_code == 200
+    assert "HTTP 200" in response.text
+    assert "DATABASE_CONNECTED" in response.text
+
+
+def test_portal_validation_rejects_invalid_csrf():
+    with patch(
+        "portal_validation_165.active_session",
+        new=AsyncMock(return_value={"csrf": "expected-csrf"}),
+    ):
+        response = client.post(
+            "/portal/validation",
+            data={"csrf": "wrong-csrf", "operation": "database"},
+        )
+
+    assert response.status_code == 403
 
 
 def test_callback_without_state():
