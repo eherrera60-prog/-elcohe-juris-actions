@@ -274,6 +274,13 @@ async def require_active_user(
         )
     claims = await run_in_threadpool(decode_access_token, token)
     if not _has_required_access(claims):
+        import logging
+        logging.getLogger("uvicorn.error").warning(
+            "OAuth: permissions_present=%s required_permission=%s required_scope=%s",
+            "permissions" in claims,
+            REQUIRED_PERMISSION in _claim_values(claims.get("permissions")),
+            REQUIRED_PERMISSION in str(claims.get("scope", "")).split(),
+        )
         raise HTTPException(403, "El token no incluye el permiso requerido.")
     subject = claims["sub"]
     if subject in bootstrap_admin_subjects():
