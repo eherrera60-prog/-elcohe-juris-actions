@@ -16,7 +16,18 @@ TC_HOST = "tribunalconstitucional.gob.do"
 TC_STORAGE_HOST = "tribunalsitestorage.blob.core.windows.net"
 
 
-def _official_tc_url(value: object) -> str | None:
+def is_official_tc_host(host: str | None) -> bool:
+    if not host:
+        return False
+    normalized = host.lower().strip(".")
+    return (
+        normalized == TC_HOST
+        or normalized.endswith("." + TC_HOST)
+        or normalized == TC_STORAGE_HOST
+    )
+
+
+def official_tc_url(value: object) -> str | None:
     if not isinstance(value, str) or not value.strip():
         return None
     try:
@@ -27,11 +38,7 @@ def _official_tc_url(value: object) -> str | None:
             or parsed.username
             or parsed.password
             or parsed.port not in (None, 443)
-            or not (
-                host == TC_HOST
-                or host.endswith("." + TC_HOST)
-                or host == TC_STORAGE_HOST
-            )
+            or not is_official_tc_host(host)
         ):
             return None
     except ValueError:
@@ -77,7 +84,7 @@ def _indexed_candidates(
     for row in rows:
         if not isinstance(row, dict):
             continue
-        url = _official_tc_url(row.get("url"))
+        url = official_tc_url(row.get("url"))
         if not url or url in seen:
             continue
         title = row.get("title") if isinstance(row.get("title"), str) else ""
