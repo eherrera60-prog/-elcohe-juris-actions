@@ -86,13 +86,17 @@ Configura Auth0 de la siguiente manera:
    la URL JWKS `/.well-known/jwks.json` se derivan de ese valor.
 3. En el servicio existente `elcohe-juris-163-test`, configura
    `AUTH0_DOMAIN`, `DATABASE_URL` y `ELCOHE_BOOTSTRAP_ADMIN_SUBJECTS` sin crear
-   otro servicio mediante un manifiesto de Render. `DATABASE_URL` debe apuntar
-   a PostgreSQL con TLS. Para conservar datos, usa PostgreSQL persistente.
+   otro servicio mediante un manifiesto de Render. `ELCOHE_BOOTSTRAP` se admite
+   como alternativa únicamente cuando la variable plural no está definida.
+   `DATABASE_URL` debe apuntar a PostgreSQL con TLS. Para conservar datos, usa
+   PostgreSQL persistente.
 4. Obtén el `sub` exacto del usuario administrador desde un token validado y
-   colócalo en `ELCOHE_BOOTSTRAP_ADMIN_SUBJECTS`. Admite varios valores
-   separados por coma. Solo esas identidades pueden administrar accesos. Para
-   retirar un administrador bootstrap, elimina su `sub` de la configuración
-   del servicio.
+   colócalo en `ELCOHE_BOOTSTRAP_ADMIN_SUBJECTS` o, si usas la alternativa,
+   `ELCOHE_BOOTSTRAP`. Admite varios valores separados por coma. Solo esas
+   identidades pueden administrar accesos. Para retirar un administrador
+   bootstrap, elimina su `sub` de la configuración del servicio.
+   Una fila explícita `SUSPENDED` o `REVOKED` en PostgreSQL bloquea también
+   a ese administrador bootstrap.
 5. En el editor de GPT, configura **Authentication: OAuth**, el Client ID y el
    Client Secret de Auth0, la URL de autorización
    `https://<AUTH0_DOMAIN>/authorize?audience=https%3A%2F%2Felcohe-juris-163-test.onrender.com`,

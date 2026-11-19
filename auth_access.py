@@ -198,9 +198,12 @@ def list_access_audit(limit: int) -> list[dict]:
 
 
 def bootstrap_admin_subjects() -> frozenset[str]:
+    subjects = os.getenv("ELCOHE_BOOTSTRAP_ADMIN_SUBJECTS")
+    if subjects is None:
+        subjects = os.getenv("ELCOHE_BOOTSTRAP", "")
     return frozenset(
         subject.strip()
-        for subject in os.getenv("ELCOHE_BOOTSTRAP_ADMIN_SUBJECTS", "").split(",")
+        for subject in subjects.split(",")
         if subject.strip()
     )
 
@@ -285,12 +288,16 @@ async def require_active_user(
         )
         raise HTTPException(403, "El token no incluye el permiso requerido.")
     subject = claims["sub"]
-    if subject in bootstrap_admin_subjects():
-        return {"sub": subject, "role": "admin"}
+    is_bootstrap_admin = subject in bootstrap_admin_subjects()
     user = await run_in_threadpool(get_authorized_user, subject)
-    if not user or user["status"] != "ACTIVE":
+    if user is not None and user["status"] != "ACTIVE":
         raise HTTPException(403, "Usuario no autorizado, suspendido o revocado.")
-    return {"sub": subject, "role": "user"}
+    if user is None and not is_bootstrap_admin:
+        raise HTTPException(403, "Usuario no autorizado, suspendido o revocado.")
+    return {
+        "sub": subject,
+        "role": "admin" if is_bootstrap_admin else "user",
+    }
 
 
 def require_admin(user: dict = Depends(require_active_user)) -> dict:

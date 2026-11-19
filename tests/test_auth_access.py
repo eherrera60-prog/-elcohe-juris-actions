@@ -81,6 +81,52 @@ class IndividualAccessTests(unittest.TestCase):
     def bearer(token):
         return {"Authorization": f"Bearer {token}"}
 
+    def test_bootstrap_alias_grants_only_the_configured_subject(self):
+        with patch.dict(
+            os.environ,
+            {"ELCOHE_BOOTSTRAP": "auth0|bootstrap-admin"},
+            clear=True,
+        ), patch(
+            "auth_access.check_database_connection",
+            return_value={"status": "DATABASE_CONNECTED"},
+        ) as database_check:
+            admin = self.client.get(
+                "/v1/admin/database/health",
+                headers=self.bearer("admin-token"),
+            )
+            member = self.client.get(
+                "/v1/scj/search-plan",
+                params={"q": "contrato"},
+                headers=self.bearer("member-token"),
+            )
+
+        self.assertEqual(admin.status_code, 200)
+        self.assertEqual(member.status_code, 403)
+        database_check.assert_called_once_with()
+
+    def test_bootstrap_alias_does_not_override_suspension_or_revocation(self):
+        with patch.dict(
+            os.environ,
+            {"ELCOHE_BOOTSTRAP": "auth0|bootstrap-admin"},
+            clear=True,
+        ), patch("auth_access.check_database_connection") as database_check:
+            for status in ("SUSPENDED", "REVOKED"):
+                self.users["auth0|bootstrap-admin"] = {
+                    "subject": "auth0|bootstrap-admin",
+                    "status": status,
+                }
+                denied = self.client.get(
+                    "/v1/admin/database/health",
+                    headers=self.bearer("admin-token"),
+                )
+                self.assertEqual(denied.status_code, 403)
+                self.assertEqual(
+                    denied.json()["detail"],
+                    "Usuario no autorizado, suspendido o revocado.",
+                )
+
+        database_check.assert_not_called()
+
     def test_jurisprudence_requires_authentication_and_authorized_user(self):
         self.assertEqual(self.client.get("/health").json(), {"ok": True})
         denied = self.client.get("/v1/scj/search-plan", params={"q": "contrato"})
