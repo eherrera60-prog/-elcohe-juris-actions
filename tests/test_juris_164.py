@@ -1014,6 +1014,55 @@ dicta la siguiente sentencia.
         self.assertFalse(result["results"][0]["official_document_verified"])
         self.assertFalse(result["results"][0]["ratio_decidendi_verified"])
 
+    def test_tc_search_uses_standard_http_profile_and_clears_default_year_filter(self):
+        class FakeResponse:
+            status_code = 200
+            headers = {"content-type": "text/html; charset=utf-8"}
+            url = httpx.URL(
+                "https://www.tribunalconstitucional.gob.do/consultas/sentencias/"
+            )
+            text = (
+                '<input id="searchString" value="TC/0019/24">'
+                '<article><span>Tribunal Constitucional 2024-05-08</span>'
+                '<a href="/consultas/secretaría/sentencias/tc001924">'
+                "TC/0019/24</a></article>"
+            )
+
+            def raise_for_status(self):
+                return None
+
+        client_options = {}
+        request_params = {}
+
+        class FakeClient:
+            def __init__(self, **kwargs):
+                client_options.update(kwargs)
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+            async def get(self, url, params):
+                request_params.update(params)
+                return FakeResponse()
+
+        with patch("app.httpx.AsyncClient", FakeClient):
+            result = asyncio.run(search_tc_decisions("TC/0019/24", None, 3))
+
+        self.assertEqual(result["status"], "CANDIDATES_FOUND")
+        self.assertEqual(result["results"][0]["decision_number"], "TC/0019/24")
+        self.assertEqual(result["results"][0]["source_status"], "NOT_VERIFIED")
+        self.assertFalse(result["results"][0]["official_document_verified"])
+        self.assertIsInstance(client_options["timeout"], httpx.Timeout)
+        self.assertEqual(client_options["timeout"].read, 90.0)
+        self.assertEqual(client_options["timeout"].connect, 10.0)
+        self.assertTrue(client_options["follow_redirects"])
+        self.assertFalse(client_options["trust_env"])
+        self.assertEqual(request_params["filtery"], "")
+        self.assertEqual(request_params["criteriay"], "")
+
     def test_tc_legacy_adapter_preserves_integrated_search_status(self):
         class FakeResponse:
             status_code = 200
@@ -1070,14 +1119,18 @@ dicta la siguiente sentencia.
                 return None
 
             async def get(self, url, params):
+                requests.append(params)
                 return FakeResponse()
 
+        requests = []
         with patch("app.httpx.AsyncClient", FakeClient):
             result = asyncio.run(search_tc(" referencia   jurídica ", None, 5))
         self.assertEqual(result["status"], "NO_RESULTS_CONFIRMED")
         self.assertTrue(result["search_executed"])
         self.assertEqual(result["query"], "referencia jurídica")
         self.assertEqual(result["results"], [])
+        self.assertEqual(requests[0]["filtery"], "")
+        self.assertEqual(requests[0]["criteriay"], "")
 
     def test_tc_empty_page_without_official_empty_state_is_extraction_failure(self):
         class FakeResponse:

@@ -900,12 +900,21 @@ async def _search_tc_candidates(q: str, year: int | None, limit: int) -> dict:
             raise HTTPException(status_code=422, detail="Año de sentencia fuera del rango permitido.")
         params.update({"filtery": str(year), "criteriay": "years"})
     else:
-        params["searchCriteria"] = ""
+        params.update({
+            "searchCriteria": "",
+            "filtery": "",
+            "criteriay": "",
+        })
     headers = {"User-Agent": f"ELCOHE-JURIS-RD/{APP_VERSION}",
                "Accept": "text/html,application/xhtml+xml"}
     try:
-        async with httpx.AsyncClient(timeout=25, follow_redirects=True,
-                                     max_redirects=MAX_REDIRECTS, headers=headers) as client:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(90.0, connect=10.0),
+            follow_redirects=True,
+            max_redirects=MAX_REDIRECTS,
+            headers=headers,
+            trust_env=False,
+        ) as client:
             response = await official_request(
                 client, "get", TC_SEARCH_URL, params=params
             )
