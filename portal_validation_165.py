@@ -93,7 +93,9 @@ async def execute_validation(request: Request):
 
     try:
         async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=request.app),
+            transport=httpx.ASGITransport(
+                app=request.app, raise_app_exceptions=False
+            ),
             base_url="https://internal.local",
             timeout=90,
             follow_redirects=False

@@ -67,6 +67,37 @@ def test_portal_validation_executes_authorized_database_check():
     assert "DATABASE_CONNECTED" in response.text
 
 
+def test_portal_validation_contains_search_runtime_errors():
+    session = {"csrf": "test-csrf", "token": "test-token"}
+    app.dependency_overrides[require_active_user] = lambda: {
+        "sub": "test-admin",
+        "role": "admin",
+    }
+    try:
+        with patch(
+            "portal_validation_165.active_session",
+            new=AsyncMock(return_value=session),
+        ), patch(
+            "juris_164.search_scj_candidates",
+            new=AsyncMock(side_effect=RuntimeError("test search failure")),
+        ):
+            client = TestClient(app, raise_server_exceptions=False)
+            responses = [
+                client.post(
+                    "/portal/validation",
+                    data={"csrf": "test-csrf", "operation": operation},
+                )
+                for operation in ("scj_tema", "scj_sentencia")
+            ]
+    finally:
+        app.dependency_overrides.pop(require_active_user, None)
+
+    for response in responses:
+        assert response.status_code == 200
+        assert "HTTP 500" in response.text
+        assert "Respuesta no JSON." in response.text
+
+
 def test_portal_validation_rejects_invalid_csrf():
     with patch(
         "portal_validation_165.active_session",
