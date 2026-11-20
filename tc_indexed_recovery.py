@@ -16,6 +16,12 @@ TC_HOST = "tribunalconstitucional.gob.do"
 TC_STORAGE_HOST = "tribunalsitestorage.blob.core.windows.net"
 
 
+def brave_search_enabled() -> bool:
+    return os.getenv("BRAVE_SEARCH_ENABLED", "").strip().casefold() in {
+        "1", "true", "yes", "on",
+    }
+
+
 def is_official_tc_host(host: str | None) -> bool:
     if not host:
         return False
@@ -130,7 +136,20 @@ async def search_tc_index(
     year: int | None = None,
     limit: int = 10,
 ) -> dict:
-    """Search Brave's documented API, accepting results only from official TC hosts."""
+    """Search Brave only after explicit opt-in, accepting official TC sources."""
+    if not brave_search_enabled():
+        return {
+            "status": "INDEX_SEARCH_DISABLED",
+            "provider": "BRAVE_SEARCH_INDEX",
+            "search_executed": False,
+            "results": [],
+            "message": (
+                "La búsqueda oficial del TC permanece disponible sin coste ni "
+                "credenciales. Brave está desactivado; habilítelo expresamente "
+                "con BRAVE_SEARCH_ENABLED=true si desea usar esa integración opcional."
+            ),
+        }
+
     api_key = os.getenv("BRAVE_SEARCH_API_KEY", "").strip()
     if not api_key:
         return {

@@ -58,7 +58,23 @@ def test_index_query_scopes_domains_and_cannot_accept_user_site_operator():
     assert "site:example.test" not in expression
 
 
-def test_index_search_without_authorized_api_key_does_not_claim_zero_results(monkeypatch):
+def test_index_search_is_disabled_by_default_even_with_api_key(monkeypatch):
+    monkeypatch.setenv("BRAVE_SEARCH_API_KEY", "unused-token")
+    monkeypatch.delenv("BRAVE_SEARCH_ENABLED", raising=False)
+
+    with patch(
+        "tc_indexed_recovery.httpx.AsyncClient",
+        side_effect=AssertionError("Brave debe permanecer desactivado"),
+    ):
+        result = asyncio.run(search_tc_index("debido proceso"))
+
+    assert result["status"] == "INDEX_SEARCH_DISABLED"
+    assert result["search_executed"] is False
+    assert result["results"] == []
+
+
+def test_enabled_index_search_without_api_key_does_not_claim_zero_results(monkeypatch):
+    monkeypatch.setenv("BRAVE_SEARCH_ENABLED", "true")
     monkeypatch.delenv("BRAVE_SEARCH_API_KEY", raising=False)
 
     result = asyncio.run(search_tc_index("debido proceso"))
@@ -69,6 +85,7 @@ def test_index_search_without_authorized_api_key_does_not_claim_zero_results(mon
 
 
 def test_index_search_uses_authorized_api_and_accepts_official_result(monkeypatch):
+    monkeypatch.setenv("BRAVE_SEARCH_ENABLED", "true")
     monkeypatch.setenv("BRAVE_SEARCH_API_KEY", "test-token")
     request = {}
 
@@ -122,7 +139,10 @@ def test_index_search_uses_authorized_api_and_accepts_official_result(monkeypatc
 
 
 @pytest.mark.parametrize("query", ["debido proceso", "TC/0019/24"])
-def test_tc_search_separates_index_candidates_from_previously_verified_documents(query):
+def test_tc_search_separates_index_candidates_from_previously_verified_documents(
+    query, monkeypatch
+):
+    monkeypatch.setenv("BRAVE_SEARCH_ENABLED", "true")
     index_result = {
         "status": "CANDIDATES_FOUND",
         "provider": "BRAVE_SEARCH_INDEX",
@@ -183,6 +203,39 @@ def test_tc_search_separates_index_candidates_from_previously_verified_documents
     )
     indexed_search.assert_awaited_once_with(query, None, 10)
     stored_search.assert_called_once_with(query, 10)
+
+
+def test_tc_search_reports_brave_disabled_without_calling_external_provider(monkeypatch):
+    monkeypatch.delenv("BRAVE_SEARCH_ENABLED", raising=False)
+    monkeypatch.setenv("BRAVE_SEARCH_API_KEY", "unused-token")
+    app.dependency_overrides[require_active_user] = lambda: {"sub": "tester"}
+    try:
+        with patch(
+            "app._search_tc_candidates",
+            new=AsyncMock(return_value={
+                "status": "ACCESS_FAILED",
+                "search_executed": True,
+                "http_status": 406,
+                "results": [],
+                "message": "El portal oficial rechazó la consulta.",
+            }),
+        ), patch(
+            "tc_indexed_recovery.httpx.AsyncClient",
+            side_effect=AssertionError("No debe consultarse Brave"),
+        ), patch("registry.find_verified_tc_references", return_value=[]):
+            response = TestClient(app).get(
+                "/v1/tc/search", params={"q": "debido proceso"}
+            )
+    finally:
+        app.dependency_overrides.pop(require_active_user, None)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["search_modes"]["indexed_search"]["status"] == "INDEX_SEARCH_DISABLED"
+    assert body["search_modes"]["indexed_search"]["provider"] == "BRAVE_SEARCH_INDEX"
+    assert body["search_modes"]["real_time_official"]["status"] == "ACCESS_FAILED"
+    assert body["search_executed"] is True
+    assert body["results"] == []
 
 
 def test_tc_search_does_not_call_index_when_official_search_finds_candidates():

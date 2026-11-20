@@ -57,18 +57,21 @@ tiempo real; los resultados oficiales, indexados y previamente verificados se
 informan por separado. Tras HTTP 406 no se llaman las rutas alternativas ya
 rechazadas.
 
-La búsqueda TC consulta primero una sola ruta oficial en tiempo real; si recibe
-HTTP 406 no reintenta ni llama las rutas alternativas ya rechazadas. Si la
-búsqueda oficial no localiza candidatos, Brave Search puede usarse como respaldo
-opcional cuando `BRAVE_SEARCH_API_KEY` esté configurada. La API de Brave Search
+La búsqueda TC usa el buscador público oficial del Tribunal Constitucional en
+tiempo real; no requiere cuenta, clave ni pago. Si recibe HTTP 406 no reintenta
+ni llama las rutas alternativas ya rechazadas. Si la búsqueda oficial no
+localiza candidatos, la consulta no depende de un índice de pago: el estado de
+la fuente oficial se conserva y se informa sin afirmar que no existan sentencias.
+
+Brave Search se conserva como integración opcional, pero está desactivada por
+defecto. Solo se consulta si se configura expresamente
+`BRAVE_SEARCH_ENABLED=true` y `BRAVE_SEARCH_API_KEY`. La API de Brave Search
 envía la consulta al índice externo, restringida a
 `tribunalconstitucional.gob.do` y
 `tribunalsitestorage.blob.core.windows.net`; además, descarta cualquier
-resultado cuyo URL no pertenezca a esos dominios. Configura
-`BRAVE_SEARCH_API_KEY` en el servicio para habilitar ese respaldo. Si falta la
-clave o el proveedor falla, la búsqueda oficial continúa disponible y el API
-informa el estado del índice por separado; no afirma que no existan sentencias.
-Revisa las condiciones y tarifas antes de configurar la clave.
+resultado cuyo URL no pertenezca a esos dominios. Esta integración puede estar
+sujeta a condiciones y tarifas del proveedor; no es necesaria para la búsqueda
+oficial.
 
 `/v1/tc/search` separa los resultados oficiales en tiempo real, los indexados y
 los documentos previamente verificados. Los resultados de búsqueda son
