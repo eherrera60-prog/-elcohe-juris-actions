@@ -1,5 +1,6 @@
 import unittest
 import asyncio
+import json
 from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
@@ -1800,6 +1801,112 @@ dicta la siguiente sentencia.
         self.assertEqual(result["archive_search"]["status"], "CANDIDATES_FOUND")
         self.assertEqual(result["results"][0]["decision_number"], "SCJ-TS-2024-01248")
         self.assertFalse(result["results"][0]["official_document_verified"])
+
+    def test_scj_candidate_without_document_url_uses_exact_archive_link(self):
+        portal = b"""<html><select id="cbSala">
+          <option value="1">Primera Sala</option>
+        </select><select id="cbMateria">
+          <option value="2">Civil y Comercial</option>
+        </select><select id="cbAno">
+          <option value="2025">2025</option>
+        </select></html>"""
+        primary_payload = {
+            "recordsFiltered": 1,
+            "data": [{
+                "noSentencia": "SCJ-PS-25-1389",
+                "descTribunal": "Primera Sala de la Suprema Corte de Justicia",
+                "fechaFallo": "2025-06-10",
+                "urlBlob": "",
+            }],
+        }
+        official_pdf = (
+            "https://transparencia.poderjudicial.gob.do/"
+            "documentos/SCJ-PS-25-1389.pdf"
+        )
+        archive_candidate = {
+            "status": "CANDIDATE",
+            "court": "SCJ",
+            "decision_number": "SCJ-PS-25-1389",
+            "tribunal": "Primera Sala de la Suprema Corte de Justicia",
+            "date": "10 de junio de 2025",
+            "source_url": official_pdf,
+            "official_document_verified": False,
+            "ratio_decidendi_verified": False,
+        }
+        responses = [
+            (
+                type("Response", (), {
+                    "status_code": 200,
+                    "headers": {"content-type": "text/html"},
+                })(),
+                portal,
+            ),
+            (
+                type("Response", (), {
+                    "status_code": 200,
+                    "headers": {"content-type": "application/json"},
+                })(),
+                json.dumps(primary_payload).encode(),
+            ),
+        ]
+        posted_forms = []
+
+        async def official_request(client, method, url, **kwargs):
+            if method == "POST":
+                posted_forms.append(kwargs["data"])
+            return responses.pop(0)
+
+        archive_search = AsyncMock(return_value={
+            "status": "CANDIDATES_FOUND",
+            "search_url": "https://poderjudicial.gob.do/",
+            "search_executed": True,
+            "results": [
+                archive_candidate,
+                dict(archive_candidate),
+                {
+                    **archive_candidate,
+                    "decision_number": "SCJ-PS-25-1390",
+                    "source_url": "https://transparencia.poderjudicial.gob.do/other.pdf",
+                },
+            ],
+        })
+
+        with patch("app.validate_official_url"), patch(
+            "app.official_stream_request", new=official_request
+        ), patch(
+            "juris_164._search_scj_official_archive",
+            new=archive_search,
+        ):
+            result = asyncio.run(search_scj_candidates(
+                "SCJ-PS-25-1389",
+                chamber="Primera Sala",
+                matter="Civil y Comercial",
+                year_from=2025,
+                year_to=2025,
+                limit=5,
+            ))
+
+        self.assertEqual(result["status"], "CANDIDATES_FOUND")
+        self.assertTrue(result["search_executed"])
+        self.assertEqual(result["filters"]["chamber"], "Primera Sala")
+        self.assertEqual(result["filters"]["matter"], "Civil y Comercial")
+        self.assertEqual(result["filters"]["year_from"], 2025)
+        self.assertEqual(result["filters"]["year_to"], 2025)
+        self.assertEqual(posted_forms[0]["IdTribunal"], "1")
+        self.assertEqual(posted_forms[0]["Materia"], "2")
+        self.assertEqual(posted_forms[0]["Ano"], "2025")
+        archive_search.assert_awaited_once()
+        self.assertEqual(result["archive_link_resolution"]["status"], "LINKED")
+        self.assertEqual(len(result["results"]), 1)
+        candidate = result["results"][0]
+        self.assertEqual(candidate["decision_number"], "SCJ-PS-25-1389")
+        self.assertEqual(candidate["source_url"], official_pdf)
+        self.assertEqual(
+            candidate["document_link_source"], "OFFICIAL_JUDICIARY_ARCHIVE"
+        )
+        self.assertEqual(candidate["document_link_status"], "CANDIDATE")
+        self.assertFalse(candidate["official_document_verified"])
+        self.assertFalse(candidate["ratio_decidendi_verified"])
 
     def test_scj_reported_rows_without_extractable_candidates_are_not_zero_results(self):
         portal = b"""<html><select id="cbSala"></select><select id="cbMateria"></select>

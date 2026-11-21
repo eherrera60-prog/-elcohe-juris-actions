@@ -685,6 +685,8 @@ async def search_scj_candidates(
     from app import (
         SCJ_PORTAL_URL,
         allowed_host,
+        canonical_scj_identifier,
+        fold,
         normalize_space,
         official_stream_request,
         validate_official_url,
@@ -880,12 +882,100 @@ async def search_scj_candidates(
             if isinstance(exc, httpx.HTTPStatusError) else None,
         ) from exc
 
+    candidates_missing_links = [
+        candidate for candidate in results if not candidate.get("source_url")
+    ]
+    if candidates_missing_links:
+        archive = await _search_scj_official_archive(
+            normalized_query, allowed_host, validate_official_url
+        )
+        response_data["search_executed"] = True
+        response_data["archive_search"] = {
+            "status": archive["status"],
+            "search_url": archive["search_url"],
+            "search_executed": archive.get("search_executed", False),
+        }
+        linked_count = 0
+        ambiguous_count = 0
+        for primary_candidate in candidates_missing_links:
+            decision_number = primary_candidate.get("decision_number")
+            canonical_number = (
+                canonical_scj_identifier(decision_number)
+                if isinstance(decision_number, str) else None
+            )
+            archive_matches = []
+            if canonical_number:
+                for archive_candidate in archive.get("results", []):
+                    if (
+                        archive_candidate.get("court") != "SCJ"
+                        or canonical_scj_identifier(
+                            str(archive_candidate.get("decision_number", ""))
+                        ) != canonical_number
+                    ):
+                        continue
+                    source_url = archive_candidate.get("source_url")
+                    parsed_url = urlparse(source_url or "")
+                    if (
+                        parsed_url.scheme != "https"
+                        or not allowed_host(parsed_url.hostname)
+                        or not parsed_url.path.lower().endswith(".pdf")
+                    ):
+                        continue
+                    if chamber and archive_candidate.get("tribunal"):
+                        if fold(chamber) not in fold(
+                            str(archive_candidate["tribunal"])
+                        ):
+                            continue
+                    archive_date = archive_candidate.get("date")
+                    if year_from is not None and isinstance(archive_date, str):
+                        archive_year = re.search(r"\b(19|20)\d{2}\b", archive_date)
+                        if archive_year and not (
+                            year_from <= int(archive_year.group(0)) <= year_to
+                        ):
+                            continue
+                    archive_matches.append(source_url)
+
+            unique_links = set(archive_matches)
+            if len(unique_links) == 1:
+                primary_candidate["source_url"] = unique_links.pop()
+                primary_candidate["document_link_source"] = (
+                    "OFFICIAL_JUDICIARY_ARCHIVE"
+                )
+                primary_candidate["document_link_status"] = "CANDIDATE"
+                primary_candidate["official_document_verified"] = False
+                primary_candidate["ratio_decidendi_verified"] = False
+                linked_count += 1
+            elif len(unique_links) > 1:
+                primary_candidate["document_link_status"] = "AMBIGUOUS"
+                ambiguous_count += 1
+            else:
+                primary_candidate["document_link_status"] = "NOT_FOUND"
+
+        response_data["archive_link_resolution"] = {
+            "status": (
+                "LINKED" if linked_count == len(candidates_missing_links)
+                else "AMBIGUOUS" if ambiguous_count
+                else "PARTIAL" if linked_count
+                else "NO_EXACT_MATCH"
+            ),
+            "linked_candidate_count": linked_count,
+            "unresolved_candidate_count": (
+                len(candidates_missing_links) - linked_count
+            ),
+        }
+
     if results:
         status = "CANDIDATES_FOUND"
-        message = (
-            "Coincidencias localizadas; verifique cada documento oficial antes "
-            "de atribuir criterios."
-        )
+        if any(not candidate.get("source_url") for candidate in results):
+            message = (
+                "El buscador SCJ localizó registros, pero alguno carece de "
+                "enlace oficial recuperable. No se confirma el documento."
+            )
+        else:
+            message = (
+                "Coincidencias localizadas; verifique cada documento oficial antes "
+                "de atribuir criterios."
+            )
     elif unparsed_results or reported_count:
         status = "EXTRACTION_FAILED"
         message = (
