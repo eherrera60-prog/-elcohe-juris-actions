@@ -1664,3 +1664,14 @@ from web_client_165 import router as web_client_router
 from portal_validation_165 import router as portal_validation_router
 app.include_router(web_client_router)
 app.include_router(portal_validation_router)
+
+# MCP is mounted on the existing authenticated service to reuse its REST handlers
+# and Render instance rather than introducing a separately billed service.
+from mcp_server import install_mcp
+install_mcp(
+    app,
+    search_tc=search_tc_recovery,
+    prepare_scj=prepare_scj_search,
+    verify_document=verify_document,
+    verify_request_model=VerifyRequest,
+)

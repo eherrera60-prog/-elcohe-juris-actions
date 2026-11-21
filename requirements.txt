@@ -2,7 +2,8 @@ fastapi==0.115.6
 uvicorn[standard]==0.34.0
 httpx==0.28.1
 beautifulsoup4==4.12.3
-pydantic==2.10.4
+pydantic==2.12.5
 pypdf==5.1.0
 psycopg[binary]==3.2.6
 PyJWT[crypto]==2.10.1
+mcp==2.2.0

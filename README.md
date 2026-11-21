@@ -157,6 +157,21 @@ Configura Auth0 de la siguiente manera:
    no crea tablas ni consulta o modifica registros. `/health` comprueba solo
    que la aplicación responde.
 
+### Conexión MCP con ChatGPT
+
+El servidor MCP remoto está disponible en `https://<dominio-publico>/mcp`.
+En un workspace de ChatGPT que permita servidores MCP personalizados, agrega
+ese endpoint y configura OAuth con la API Auth0 descrita arriba. Registra en
+Auth0 la URL de callback que muestre ChatGPT y solicita
+`access:jurisprudence offline_access`. Auth0 debe permitir acceso sin conexión
+y emitir refresh tokens para esa aplicación; confirma que su metadata OIDC
+anuncie `offline_access`. ChatGPT renueva el acceso mediante Auth0; ELCOHE-JURIS
+solo valida los access tokens y no almacena refresh tokens ni secretos.
+
+El `sub` del usuario debe estar autorizado como `ACTIVE` en ELCOHE-JURIS.
+Prueba el descubrimiento y una llamada autenticada en un entorno de
+preproducción antes de publicar la app en el workspace.
+
 ### Prueba con una aplicación Machine-to-Machine
 
 El API acepta tokens M2M y tokens de usuario mediante el mismo bearer JWT; no
