@@ -1,5 +1,6 @@
 
 import os
+from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
 from unittest.mock import AsyncMock, patch
 
@@ -109,6 +110,94 @@ def test_portal_validation_rejects_invalid_csrf():
         )
 
     assert response.status_code == 403
+
+
+def test_admin_session_activates_m2m_without_exposing_credentials():
+    session = {
+        "csrf": "test-csrf",
+        "token": "test-token",
+        "role": "admin",
+    }
+    upstream = AsyncMock()
+    upstream.__aenter__.return_value = upstream
+    upstream.put.return_value = SimpleNamespace(status_code=200)
+
+    with patch.dict(os.environ, {"AUTH0_CLIENT_ID": "test-m2m-client"}), patch(
+        "web_client_165.active_session",
+        new=AsyncMock(return_value=session),
+    ), patch(
+        "web_client_165.httpx.AsyncClient",
+        return_value=upstream,
+    ):
+        response = client.post(
+            "/portal/admin/activate-m2m",
+            data={"csrf": "test-csrf"},
+        )
+
+    assert response.status_code == 200
+    assert response.text == "HTTP 200"
+    upstream.put.assert_awaited_once_with(
+        "/v1/admin/users/status",
+        json={
+            "subject": "test-m2m-client@clients",
+            "status": "ACTIVE",
+        },
+        headers={"Authorization": "Bearer test-token"},
+    )
+
+
+def test_m2m_activation_rejects_non_admin_session():
+    session = {
+        "csrf": "test-csrf",
+        "token": "test-token",
+        "role": "user",
+    }
+
+    with patch(
+        "web_client_165.active_session",
+        new=AsyncMock(return_value=session),
+    ), patch("web_client_165.httpx.AsyncClient") as http_client:
+        response = client.post(
+            "/portal/admin/activate-m2m",
+            data={"csrf": "test-csrf"},
+        )
+
+    assert response.status_code == 403
+    http_client.assert_not_called()
+
+
+def test_m2m_activation_rejects_invalid_csrf():
+    session = {
+        "csrf": "test-csrf",
+        "token": "test-token",
+        "role": "admin",
+    }
+
+    with patch(
+        "web_client_165.active_session",
+        new=AsyncMock(return_value=session),
+    ), patch("web_client_165.httpx.AsyncClient") as http_client:
+        response = client.post(
+            "/portal/admin/activate-m2m",
+            data={"csrf": "wrong-csrf"},
+        )
+
+    assert response.status_code == 403
+    http_client.assert_not_called()
+
+
+def test_m2m_activation_requires_existing_session():
+    with patch(
+        "web_client_165.active_session",
+        new=AsyncMock(return_value=None),
+    ), patch("web_client_165.httpx.AsyncClient") as http_client:
+        response = client.post(
+            "/portal/admin/activate-m2m",
+            data={"csrf": "test-csrf"},
+        )
+
+    assert response.status_code == 401
+    http_client.assert_not_called()
 
 
 def test_callback_without_state():

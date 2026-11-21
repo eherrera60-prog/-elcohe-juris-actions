@@ -6,7 +6,7 @@ import hashlib
 import os
 import secrets
 import time
-from urllib.parse import urlencode, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 import httpx
 
@@ -236,13 +236,14 @@ async def active_session(request: Request):
         return None
 
     try:
-        await require_active_user(
+        user = await require_active_user(
             request, token=session["token"]
         )
     except HTTPException:
         SESSIONS.pop(identifier, None)
         raise
 
+    session["role"] = user["role"]
     return session
 
 
@@ -259,6 +260,13 @@ async def portal(request: Request):
         )
 
     csrf = session["csrf"]
+    admin_action = ""
+    if session.get("role") == "admin":
+        admin_action = (
+            "<form method='post' action='/portal/admin/activate-m2m'>"
+            f"<input type='hidden' name='csrf' value='{csrf}'>"
+            "<button type='submit'>Activar cliente M2M</button></form>"
+        )
 
     return HTMLResponse(
         "<!doctype html><html lang='es'><meta charset='utf-8'>"
@@ -268,11 +276,26 @@ async def portal(request: Request):
         "<p>Sesión jurisprudencial activa.</p>"
         "<p><a href='/portal/validation'>"
         "Validación funcional</a></p>"
+        f"{admin_action}"
         "<form method='post' action='/auth/logout'>"
         f"<input type='hidden' name='csrf' value='{csrf}'>"
         "<button>Cerrar sesión</button></form></html>",
         headers=HEADERS,
     )
+
+
+async def validate_csrf(request: Request, expected: str) -> None:
+    raw = await request.body()
+    if len(raw) > 2048:
+        raise HTTPException(400, "Solicitud inválida.")
+
+    try:
+        csrf = parse_qs(raw.decode()).get("csrf", [""])[0]
+    except UnicodeError:
+        raise HTTPException(400, "Solicitud inválida.")
+
+    if not secrets.compare_digest(expected, csrf):
+        raise HTTPException(403, "Solicitud no autorizada.")
 
 
 @router.post("/auth/logout", include_in_schema=False)
@@ -287,22 +310,53 @@ async def logout(request: Request):
         clear_cookie(response, COOKIE)
         return response
 
-    from urllib.parse import parse_qs
-
-    raw = await request.body()
-    if len(raw) > 2048:
-        raise HTTPException(400, "Solicitud inválida.")
-
-    try:
-        csrf = parse_qs(raw.decode()).get("csrf", [""])[0]
-    except UnicodeError:
-        raise HTTPException(400, "Solicitud inválida.")
-
-    if not secrets.compare_digest(session["csrf"], csrf):
-        raise HTTPException(403, "Solicitud no autorizada.")
+    await validate_csrf(request, session["csrf"])
 
     SESSIONS.pop(identifier, None)
 
     response = redirect("/portal")
     clear_cookie(response, COOKIE)
     return response
+
+
+@router.post("/portal/admin/activate-m2m", include_in_schema=False)
+async def activate_m2m(request: Request):
+    session = await active_session(request)
+    if not session:
+        raise HTTPException(401, "Se requiere una sesión autenticada.")
+    if session.get("role") != "admin":
+        raise HTTPException(403, "Se requiere permiso administrativo.")
+
+    await validate_csrf(request, session["csrf"])
+
+    client_id = os.getenv("AUTH0_CLIENT_ID", "").strip()
+    if not client_id or len(client_id) > 247 or any(
+        character.isspace() for character in client_id
+    ):
+        raise HTTPException(503, "Cliente M2M no configurado.")
+
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(
+                app=request.app, raise_app_exceptions=False
+            ),
+            base_url="https://internal.local",
+            timeout=20,
+            follow_redirects=False,
+        ) as http:
+            result = await http.put(
+                "/v1/admin/users/status",
+                json={
+                    "subject": f"{client_id}@clients",
+                    "status": "ACTIVE",
+                },
+                headers={"Authorization": f"Bearer {session['token']}"},
+            )
+    except httpx.HTTPError as exc:
+        raise HTTPException(502, "No se pudo completar la autorización M2M.") from exc
+
+    return HTMLResponse(
+        f"HTTP {result.status_code}",
+        status_code=result.status_code,
+        headers=HEADERS,
+    )

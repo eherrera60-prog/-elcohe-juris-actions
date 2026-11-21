@@ -268,6 +268,7 @@ async def require_active_user(
         ("POST", "/auth/logout"),
         ("GET", "/portal/validation"),
         ("POST", "/portal/validation"),
+        ("POST", "/portal/admin/activate-m2m"),
     }:
         return {"sub": None, "role": "public"}
     if request.url.path == "/health":
