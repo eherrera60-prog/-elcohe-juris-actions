@@ -16,6 +16,7 @@ from starlette.concurrency import run_in_threadpool
 
 AUTH0_AUDIENCE = "https://elcohe-juris-164-final"
 REQUIRED_PERMISSION = "access:jurisprudence"
+MCP_PATH = "/mcp"
 
 
 def _auth0_domain_url() -> str:
@@ -51,6 +52,29 @@ def _oauth_url(suffix: str) -> str:
     if suffix == "/authorize":
         return f"{base_url}{suffix}?{urlencode({'audience': AUTH0_AUDIENCE})}"
     return f"{base_url}{suffix}"
+
+
+def external_origin() -> str | None:
+    external_url = os.getenv("RENDER_EXTERNAL_URL", "").strip()
+    if not external_url:
+        return None
+    parsed = urlparse(external_url)
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in ("", "/")
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise HTTPException(503, "RENDER_EXTERNAL_URL debe ser una URL HTTPS de origen.")
+    return f"https://{parsed.netloc}"
+
+
+def mcp_resource_url(request: Request) -> str:
+    origin = external_origin() or str(request.base_url).rstrip("/")
+    return f"{origin}{MCP_PATH}"
 
 
 oauth2_scheme = OAuth2AuthorizationCodeBearer(
@@ -213,7 +237,7 @@ def _jwks_client(url: str) -> PyJWKClient:
     return PyJWKClient(url, cache_keys=True)
 
 
-def decode_access_token(token: str) -> dict:
+def decode_access_token(token: str, *, audience: str = AUTH0_AUDIENCE) -> dict:
     domain_url = _auth0_domain_url()
     issuer = f"{domain_url}/"
     jwks_url = f"{domain_url}/.well-known/jwks.json"
@@ -228,7 +252,7 @@ def decode_access_token(token: str) -> dict:
             token,
             signing_key,
             algorithms=["RS256"],
-            audience=AUTH0_AUDIENCE,
+            audience=audience,
             issuer=issuer,
             options={"require": ["exp", "iat", "sub"]},
         )
@@ -279,7 +303,14 @@ async def require_active_user(
             "Se requiere autenticación OAuth.",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    claims = await run_in_threadpool(decode_access_token, token)
+    audience = (
+        mcp_resource_url(request)
+        if request.url.path == MCP_PATH
+        else AUTH0_AUDIENCE
+    )
+    claims = await run_in_threadpool(
+        decode_access_token, token, audience=audience
+    )
     if not _has_required_access(claims):
         import logging
         logging.getLogger("uvicorn.error").warning(

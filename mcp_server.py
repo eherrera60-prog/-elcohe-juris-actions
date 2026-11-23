@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-import os
 from urllib.parse import urlparse
 
 from fastapi import HTTPException
@@ -16,7 +15,7 @@ import auth_access
 
 
 APP_VERSION = "1.6.5"
-MCP_PATH = "/mcp"
+MCP_PATH = auth_access.MCP_PATH
 METADATA_PATHS = frozenset({
     "/.well-known/oauth-protected-resource",
     "/.well-known/oauth-protected-resource/mcp",
@@ -33,33 +32,12 @@ mcp = MCPServer(
 )
 
 
-def _external_origin() -> str | None:
-    external_url = os.getenv("RENDER_EXTERNAL_URL", "").strip()
-    if not external_url:
-        return None
-    parsed = urlparse(external_url)
-    if (
-        parsed.scheme != "https"
-        or not parsed.hostname
-        or parsed.username is not None
-        or parsed.password is not None
-        or parsed.path not in ("", "/")
-        or parsed.query
-        or parsed.fragment
-    ):
-        raise HTTPException(503, "RENDER_EXTERNAL_URL debe ser una URL HTTPS de origen.")
-    return f"https://{parsed.netloc}"
-
-
 def _resource_url(request: Request) -> str:
-    origin = _external_origin()
-    if origin:
-        return f"{origin}{MCP_PATH}"
-    return f"{str(request.base_url).rstrip('/')}{MCP_PATH}"
+    return auth_access.mcp_resource_url(request)
 
 
 def _transport_security_settings() -> TransportSecuritySettings:
-    origin = _external_origin()
+    origin = auth_access.external_origin()
     if origin:
         parsed = urlparse(origin)
         hostname = parsed.hostname or ""
@@ -119,7 +97,10 @@ class MCPAuthMiddleware(BaseHTTPMiddleware):
         except HTTPException as exc:
             headers = dict(exc.headers or {})
             if exc.status_code == 401:
-                origin = _external_origin() or str(request.base_url).rstrip("/")
+                origin = (
+                    auth_access.external_origin()
+                    or str(request.base_url).rstrip("/")
+                )
                 resource_metadata = (
                     f"{origin}"
                     "/.well-known/oauth-protected-resource/mcp"
