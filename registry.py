@@ -51,6 +51,14 @@ CREATE TABLE IF NOT EXISTS elcohe_decisions (
     UNIQUE (court, decision_number, sha256)
 );
 CREATE INDEX IF NOT EXISTS idx_elcohe_decisions_number ON elcohe_decisions(court, decision_number);
+CREATE TABLE IF NOT EXISTS elcohe_decision_documents (
+    decision_id BIGINT PRIMARY KEY REFERENCES elcohe_decisions(id) ON DELETE RESTRICT,
+    sha256 CHAR(64) NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
+    content_type TEXT NOT NULL CHECK (content_type = 'application/pdf'),
+    page_count INTEGER NOT NULL CHECK (page_count > 0),
+    document_bytes BYTEA NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 """
 
 
@@ -63,6 +71,35 @@ def init_schema(conn):
 
 def row_to_dict(row: tuple, fields: list[str]) -> dict[str, Any]:
     return dict(zip(fields, row))
+
+
+def persist_verified_pdf(
+    cursor,
+    decision_id: int,
+    data: bytes,
+    digest: str,
+    page_count: int,
+) -> None:
+    if (
+        not isinstance(data, bytes)
+        or not data.startswith(b"%PDF")
+        or hashlib.sha256(data).hexdigest() != digest
+        or page_count < 1
+    ):
+        raise HTTPException(422, "No se puede persistir un PDF sin integridad verificada.")
+    cursor.execute(
+        """
+        INSERT INTO elcohe_decision_documents
+            (decision_id,sha256,content_type,page_count,document_bytes)
+        VALUES (%s,%s,'application/pdf',%s,%s)
+        ON CONFLICT (decision_id) DO UPDATE SET
+            sha256=EXCLUDED.sha256,
+            content_type=EXCLUDED.content_type,
+            page_count=EXCLUDED.page_count,
+            document_bytes=EXCLUDED.document_bytes
+        """,
+        (decision_id, digest, page_count, data),
+    )
 
 
 def _is_official_tc_host(host: str | None) -> bool:
@@ -205,9 +242,15 @@ async def register_tc_reference(req: TCReferenceRequest):
                             stored[0],
                         ),
                     )
+                    persist_verified_pdf(
+                        cur, stored[0], data, digest, page_count
+                    )
                     status = "ALREADY_VERIFIED_SOURCE"
                     deduplicated = True
                 else:
+                    persist_verified_pdf(
+                        cur, stored[0], data, digest, page_count
+                    )
                     status = "STORED_VERIFIED_SOURCE"
                     deduplicated = False
         return {
@@ -261,6 +304,11 @@ def find_verified_tc_references(query: str, limit: int = 10) -> list[dict]:
                     FROM elcohe_decisions
                     WHERE """ + conditions + """
                       AND metadata->>'document_type'='PDF'
+                      AND EXISTS (
+                          SELECT 1 FROM elcohe_decision_documents doc
+                          WHERE doc.decision_id=elcohe_decisions.id
+                            AND doc.sha256=elcohe_decisions.sha256
+                      )
                     ORDER BY created_at DESC LIMIT %s
                     """,
                     parameters + [limit],
@@ -269,16 +317,178 @@ def find_verified_tc_references(query: str, limit: int = 10) -> list[dict]:
                 items = [row_to_dict(row, fields) for row in cur.fetchall()]
         for item in items:
             item["retrieval_mode"] = "PREVIOUSLY_VERIFIED_DOCUMENT"
+            item["document_bytes_persisted"] = True
             item["official_document_verified"] = True
             item["identity_status"] = "VERIFIED_IDENTITY"
-            item["ratio_decidendi_verified"] = False
-            item["review_required"] = True
         return items
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(
             503, f"Error al consultar referencias verificadas ({type(exc).__name__})."
+        ) from exc
+
+
+def find_verified_decisions(
+    query: str,
+    court: str | None = None,
+    limit: int = 10,
+) -> list[dict]:
+    """Find verified PDF references with their persisted bytes available."""
+    normalized_query = query.strip()
+    if not normalized_query:
+        raise HTTPException(422, "La consulta no puede estar vacía.")
+    if court is not None and court not in {"SCJ", "TC"}:
+        raise HTTPException(422, "El tribunal debe ser SCJ o TC.")
+    if not 1 <= limit <= 100:
+        raise HTTPException(422, "El límite debe estar entre 1 y 100.")
+
+    conditions = [
+        "d.verification_status IN ('VERIFIED_SOURCE','HOLDING_CANDIDATE')",
+        "COALESCE(d.metadata->>'document_type', "
+        "d.extraction_diagnostics->>'document_type') = 'PDF'",
+        "EXISTS (SELECT 1 FROM elcohe_decision_documents doc "
+        "WHERE doc.decision_id=d.id AND doc.sha256=d.sha256)",
+    ]
+    parameters: list[Any] = []
+    if court:
+        conditions.append("d.court=%s")
+        parameters.append(court)
+
+    escaped = (
+        normalized_query.replace("\\", "\\\\")
+        .replace("%", "\\%")
+        .replace("_", "\\_")
+    )
+    conditions.append(
+        "(d.decision_number ILIKE %s ESCAPE '\\' "
+        "OR COALESCE(d.legal_issue,'') ILIKE %s ESCAPE '\\' "
+        "OR COALESCE(d.chamber,'') ILIKE %s ESCAPE '\\')"
+    )
+    pattern = f"%{escaped}%"
+    parameters.extend((pattern, pattern, pattern, limit))
+
+    try:
+        with connect() as conn:
+            init_schema(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT d.id,d.court,d.decision_number,d.source_url,d.sha256,
+                           d.chamber,d.decision_date,d.case_number,d.legal_issue,
+                           d.verification_status,d.review_required,
+                           d.ratio_decidendi_verified,d.metadata,
+                           d.extraction_diagnostics,d.created_at
+                    FROM elcohe_decisions d
+                    WHERE """ + " AND ".join(conditions) + """
+                    ORDER BY d.created_at DESC LIMIT %s
+                    """,
+                    parameters,
+                )
+                fields = [column.name for column in cur.description]
+                items = [row_to_dict(row, fields) for row in cur.fetchall()]
+        for item in items:
+            item["retrieval_mode"] = "PREVIOUSLY_VERIFIED_DOCUMENT"
+            item["document_bytes_persisted"] = True
+            item["official_document_verified"] = True
+            item["identity_status"] = "VERIFIED_IDENTITY"
+        return items
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            503, f"Error al consultar decisiones verificadas ({type(exc).__name__})."
+        ) from exc
+
+
+def get_verified_document(decision_id: int) -> dict:
+    """Retrieve stored PDF bytes only when their hash and verified identity agree."""
+    if decision_id < 1:
+        raise HTTPException(422, "Identificador inválido.")
+    from app import (
+        allowed_host,
+        court_matches,
+        decision_number_matches,
+        detect_court,
+        extract_document_text,
+    )
+
+    try:
+        with connect() as conn:
+            init_schema(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT d.id,d.court,d.decision_number,d.source_url,d.sha256,
+                           d.verification_status,d.review_required,
+                           d.ratio_decidendi_verified,d.metadata,
+                           d.extraction_diagnostics,
+                           doc.content_type,doc.page_count,doc.document_bytes
+                    FROM elcohe_decisions d
+                    JOIN elcohe_decision_documents doc ON doc.decision_id=d.id
+                    WHERE d.id=%s
+                      AND d.verification_status IN ('VERIFIED_SOURCE','HOLDING_CANDIDATE')
+                      AND doc.sha256=d.sha256
+                    """,
+                    (decision_id,),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    raise HTTPException(404, "Documento verificado no encontrado.")
+                fields = [column.name for column in cur.description]
+                result = row_to_dict(row, fields)
+        data = result.pop("document_bytes")
+        parsed_source = urlparse(result["source_url"])
+        if (
+            result["content_type"] != "application/pdf"
+            or not isinstance(data, bytes)
+            or not data.startswith(b"%PDF")
+            or hashlib.sha256(data).hexdigest() != result["sha256"]
+            or parsed_source.scheme != "https"
+            or not allowed_host(parsed_source.hostname)
+        ):
+            raise HTTPException(
+                422,
+                "La fuente oficial o integridad del PDF almacenado no pudo verificarse.",
+            )
+        extracted = extract_document_text({
+            "data": data,
+            "content_type": result["content_type"],
+            "host": parsed_source.hostname,
+        })
+        detected_court = detect_court(
+            parsed_source.hostname,
+            result["court"],
+            extracted["full_text"],
+        )
+        if (
+            not extracted["extraction_ok"]
+            or extracted["page_count"] != result["page_count"]
+            or not court_matches(detected_court, result["court"])
+            or not decision_number_matches(
+                extracted["full_text"],
+                detected_court,
+                result["decision_number"],
+            )
+        ):
+            raise HTTPException(
+                422,
+                "La identidad del documento almacenado no coincide con su registro.",
+            )
+        result.update({
+            "document_bytes": data,
+            "document_type": "PDF",
+            "source_status": "VERIFIED_SOURCE",
+            "official_document_verified": True,
+            "identity_status": "VERIFIED_IDENTITY",
+            "document_recovered": True,
+        })
+        return result
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            503, f"Error al recuperar el documento verificado ({type(exc).__name__})."
         ) from exc
 
 
@@ -300,12 +510,18 @@ async def register_verified_tc_reference(req: TCReferenceRequest):
 )
 async def register_decision(req: RegisterRequest):
     # Importación diferida: reutiliza exactamente el verificador de la aplicación original.
-    from app import AnalyzeDecisionRequest, analyze_official_decision
+    from app import AnalyzeDecisionRequest, _analyze_official_decision
     from psycopg.types.json import Jsonb
 
-    analysis = await analyze_official_decision(AnalyzeDecisionRequest(**req.model_dump()))
+    analysis = await _analyze_official_decision(
+        AnalyzeDecisionRequest(**req.model_dump()),
+        include_document_bytes=True,
+    )
     if not analysis.get("official_source_verified") or analysis.get("status") not in ("VERIFIED_SOURCE", "HOLDING_CANDIDATE"):
         raise HTTPException(422, "Documento no verificado; no se almacena.")
+    document_bytes = analysis.pop("_verified_document_bytes", None)
+    if not isinstance(document_bytes, bytes) or not document_bytes.startswith(b"%PDF"):
+        raise HTTPException(422, "Solo se almacenan bytes de un PDF oficial verificado.")
     meta = analysis.get("metadata") or {}
     court = analysis["jurisprudential_card"]["tribunal"]
     number = meta.get("decision_number")
@@ -314,6 +530,19 @@ async def register_decision(req: RegisterRequest):
     digest = analysis.get("sha256", "")
     if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
         raise HTTPException(422, "Huella documental inválida.")
+    if hashlib.sha256(document_bytes).hexdigest() != digest:
+        raise HTTPException(422, "La huella del PDF no coincide con sus bytes.")
+    page_count = analysis.get("page_count")
+    if not isinstance(page_count, int) or page_count < 1:
+        raise HTTPException(422, "No se verificó la cantidad de páginas del PDF.")
+    meta = {**meta, "document_type": "PDF", "page_count": page_count}
+    diagnostics = {
+        **(analysis.get("extraction_diagnostics") or {}),
+        "document_type": "PDF",
+        "page_count": page_count,
+        "document_bytes": len(document_bytes),
+        "source_sha256": digest,
+    }
     try:
         with connect() as conn:
             init_schema(conn)
@@ -335,8 +564,11 @@ async def register_decision(req: RegisterRequest):
                 """, (court, number, analysis["source_url"], digest, meta.get("chamber"),
                       meta.get("date"), meta.get("case_number"), req.legal_issue,
                       analysis["status"], Jsonb(analysis.get("relevant_passages", [])),
-                      Jsonb(meta), Jsonb(analysis.get("extraction_diagnostics", {}))))
+                      Jsonb(meta), Jsonb(diagnostics)))
                 id_, created, updated = cur.fetchone()
+                persist_verified_pdf(
+                    cur, id_, document_bytes, digest, page_count
+                )
         return {"status": "STORED_VERIFIED_SOURCE", "id": id_, "court": court,
                 "decision_number": number, "sha256": digest, "source_url": analysis["source_url"],
                 "verification_status": analysis["status"], "review_required": True,

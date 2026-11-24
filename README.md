@@ -160,6 +160,16 @@ Configura Auth0 de la siguiente manera:
 ### Conexión MCP con ChatGPT
 
 El servidor MCP remoto está disponible en `https://<dominio-publico>/mcp`.
+Publica `search_scj_decisions` para ejecutar la consulta oficial (a diferencia
+de `prepare_scj_search`, que solo la prepara), `recover_official_pdf` para
+localizar y recuperar el PDF candidato desde una ficha oficial,
+`extract_decision_passages` para fundamentos y dispositivo con páginas y
+contexto, y `propose_ratio_decidendi` para presentar una hipótesis basada en
+pasajes literales que siempre queda pendiente de revisión jurídica humana.
+`get_verified_decisions` busca referencias cuyo PDF verificado está persistido
+en PostgreSQL, y `get_verified_decision_document` recupera esos bytes tras
+comprobar nuevamente su SHA-256. La búsqueda, localización, recuperación,
+verificación de fuente, identidad y pasaje se reportan como estados distintos.
 En un workspace de ChatGPT que permita servidores MCP personalizados, agrega
 ese endpoint y configura OAuth con la API Auth0 descrita arriba. Registra en
 Auth0 la URL de callback que muestre ChatGPT y solicita

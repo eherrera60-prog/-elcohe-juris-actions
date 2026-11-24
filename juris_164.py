@@ -498,6 +498,11 @@ def _foundation_payload(req, doc: dict, extracted: dict | None) -> dict:
         "status": "NOT_VERIFIED",
         **evidence_classification_fields(),
         "source_status": source_status,
+        "document_recovered": (
+            isinstance(doc.get("data"), bytes)
+            and doc["data"].startswith(b"%PDF")
+        ),
+        "official_source_verified": official_pdf,
         "identity_status": "NOT_VERIFIED",
         "passage_status": "NOT_VERIFIED",
         "official_document_verified": False,
@@ -528,12 +533,20 @@ def _foundation_payload(req, doc: dict, extracted: dict | None) -> dict:
 
     court = detect_court(doc["host"], req.expected_court, extracted["full_text"])
     metadata = extract_metadata_from_text(extracted["full_text"], court)
+    deciding_court = (
+        metadata.get("chamber")
+        if court == "SCJ" else
+        "Tribunal Constitucional" if court == "TC" else None
+    )
+    if court == "SCJ" and not deciding_court:
+        deciding_court = "Suprema Corte de Justicia; sala no identificada"
     court_ok = court_matches(court, req.expected_court)
     number_ok = decision_number_matches(
         extracted["full_text"], court, req.expected_number
     )
     base.update({
         "court": court,
+        "deciding_court": deciding_court,
         "metadata": metadata,
         "expected_court_match": court_ok,
         "expected_number_match": number_ok,
@@ -599,43 +612,100 @@ def _foundation_payload(req, doc: dict, extracted: dict | None) -> dict:
     dispositive_payload = None
     if dispositive:
         dispositive_text = normalize_space(dispositive["text"])
+        start_page = dispositive["page"]
+        end_page = dispositive["end_page"]
+        page_text = next(
+            item["text"] for item in extracted["pages"]
+            if item["page"] == start_page
+        )
+        marker = re.search(
+            r"(?im)^\s*(?:FALLA|DECIDE|RESUELVE)\s*:", page_text
+        )
+        previous_page = next(
+            (
+                normalize_space(item["text"])[-500:]
+                for item in extracted["pages"]
+                if item["page"] == start_page - 1
+            ),
+            None,
+        )
+        following_page = next(
+            (
+                normalize_space(item["text"])[:500]
+                for item in extracted["pages"]
+                if item["page"] == end_page + 1
+            ),
+            None,
+        )
         dispositive_payload = {
             "status": "VERIFIED_PASSAGE",
             "section": "PART_DISPOSITIVE_CANDIDATE",
-            "page": dispositive["page"],
-            "end_page": dispositive["end_page"],
+            "page": start_page,
+            "end_page": end_page,
+            "context_pages": list(range(
+                max(1, start_page - 1),
+                min(extracted["page_count"], end_page + 1) + 1,
+            )),
+            "preceding_context": (
+                normalize_space(page_text[:marker.start()])[-500:]
+                if marker else previous_page
+            ),
+            "following_context": following_page,
             "text": dispositive_text[:5000],
             "text_truncated": len(dispositive_text) > 5000,
             "review_required": True,
             "legal_effect_verified": False,
         }
-    candidates = [
-        unit for unit in units
+    indexed_candidates = [
+        (index, unit) for index, unit in enumerate(units)
         if unit.get("section") == "DECIDING_COURT" and unit.get("text")
     ]
     if req.legal_issue:
-        candidates.sort(
-            key=lambda unit: score_passage(
-                unit["text"], req.legal_issue, unit.get("attribution")
+        indexed_candidates.sort(
+            key=lambda item: score_passage(
+                item[1]["text"], req.legal_issue, item[1].get("attribution")
             ),
             reverse=True,
         )
     passages = []
-    for unit in candidates[:req.limit]:
+    for index, unit in indexed_candidates[:req.limit]:
         passage = normalize_space(unit["text"])
+        preceding = (
+            normalize_space(units[index - 1]["text"])[-500:]
+            if index > 0
+            and units[index - 1].get("section") == "DECIDING_COURT"
+            else None
+        )
+        following = (
+            normalize_space(units[index + 1]["text"])[:500]
+            if index + 1 < len(units)
+            and units[index + 1].get("section") == "DECIDING_COURT"
+            else None
+        )
+        page = unit["page"]
+        end_page = unit.get("end_page", page)
+        context_pages = sorted({
+            page,
+            end_page,
+            *(
+                item["page"] for item in extracted["pages"]
+                if abs(item["page"] - page) <= 1
+            ),
+        })
         passages.append({
             "status": "VERIFIED_PASSAGE",
             **evidence_classification_fields(),
             "legal_holding_status": "CANDIDATE",
             "court": court,
-            "tribunal": metadata.get("chamber") or (
-                "Tribunal Constitucional" if court == "TC"
-                else "Suprema Corte de Justicia"
-            ),
+            "tribunal": deciding_court,
+            "decision_court": deciding_court,
             "decision_number": metadata.get("decision_number"),
             "date": metadata.get("date"),
-            "page": unit["page"],
-            "end_page": unit.get("end_page", unit["page"]),
+            "page": page,
+            "end_page": end_page,
+            "context_pages": context_pages,
+            "preceding_context": preceding,
+            "following_context": following,
             "foundation_number": unit["foundation_number"],
             "passage": passage[:5000],
             "passage_truncated": len(passage) > 5000,
@@ -649,6 +719,8 @@ def _foundation_payload(req, doc: dict, extracted: dict | None) -> dict:
         })
     base.update({
         "status": "VERIFIED_PASSAGE" if passages else "VERIFIED_IDENTITY",
+        "official_document_verified": True,
+        "deciding_court": deciding_court,
         "passage_status": "VERIFIED_PASSAGE" if passages else "NOT_VERIFIED",
         "foundations": passages,
         "dispositive_status": (
@@ -657,7 +729,7 @@ def _foundation_payload(req, doc: dict, extracted: dict | None) -> dict:
         "dispositive": dispositive_payload,
         "extraction_diagnostics": {
             "numbered_foundations_detected": len(units),
-            "deciding_court_foundations": len(candidates),
+            "deciding_court_foundations": len(indexed_candidates),
             "passages_returned": len(passages),
             "dispositive_page": (
                 dispositive_payload["page"] if dispositive_payload else None
@@ -671,6 +743,18 @@ def _foundation_payload(req, doc: dict, extracted: dict | None) -> dict:
     })
     base["document_continuity"] = continuity_candidates
     return base
+
+
+async def extract_decision_passages(req: FoundationExtractionRequest) -> dict:
+    """Run the same official-PDF extraction used by the REST endpoint."""
+    from app import extract_document_text, fetch_document
+
+    doc = await fetch_document(str(req.url))
+    extracted = (
+        extract_document_text(doc)
+        if doc["data"].startswith(b"%PDF") else None
+    )
+    return _foundation_payload(req, doc, extracted)
 
 
 async def search_scj_candidates(
@@ -1088,11 +1172,4 @@ def install(app: FastAPI) -> None:
 
     @app.post("/v1/extract-foundations", operation_id="extractVerifiedFoundations")
     async def extract_verified_foundations(req: FoundationExtractionRequest):
-        from app import extract_document_text, fetch_document
-
-        doc = await fetch_document(str(req.url))
-        extracted = (
-            extract_document_text(doc)
-            if doc["data"].startswith(b"%PDF") else None
-        )
-        return _foundation_payload(req, doc, extracted)
+        return await extract_decision_passages(req)

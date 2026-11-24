@@ -28,6 +28,7 @@ from juris_164 import (
     _search_scj_official_archive,
     search_scj_candidates,
 )
+from foundation_origin_165 import classify_contextual_origin
 
 
 SCJ_TEXT = """SUPREMA CORTE DE JUSTICIA
@@ -139,6 +140,14 @@ class FoundationExtractionTests(unittest.TestCase):
         self.assertTrue(result["relevant_passages"])
         self.assert_evidence_is_not_a_verified_criterion(result["relevant_passages"][0])
         self.assertIsNone(result["jurisprudential_card"]["ratio_decidendi"])
+        self.assertNotIn("_verified_document_bytes", result)
+        analyze_parameters = app.openapi()["paths"]["/v1/analyze-decision"]["post"].get(
+            "parameters", []
+        )
+        self.assertNotIn(
+            "include_document_bytes",
+            {parameter["name"] for parameter in analyze_parameters},
+        )
 
     def test_decision_excerpt_is_source_text_not_interpretation(self):
         with patch("app.fetch_document", new=AsyncMock(return_value=official_pdf())), \
@@ -1975,6 +1984,23 @@ dicta la siguiente sentencia.
         self.assertEqual(raised.exception.status_code, 502)
         self.assertEqual(raised.exception.detail["status"], "ACCESS_FAILED")
         self.assertFalse(raised.exception.detail["search_executed"])
+
+
+def test_cited_precedents_are_identified_without_certifying_judicial_origin():
+    unit = {
+        "text": "1) Esta Primera Sala cita como precedente la sentencia TC/0099/22.",
+        "attribution": "UNDETERMINED_REQUIRES_CONTEXT",
+        "attribution_indicators": [],
+    }
+
+    result = classify_contextual_origin(unit)
+
+    assert result["reasoning_origin"] == "CITED_PRECEDENT_OR_MIXED_REVIEW"
+    assert "explicit_precedent_reference" in result[
+        "origin_classification_indicators"
+    ]
+    assert result["origin_verified"] is False
+    assert result["origin_review_required"] is True
 
 
 if __name__ == "__main__":

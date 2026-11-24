@@ -1475,6 +1475,8 @@ async def verify_official_pdf(req: OfficialPdfRequest):
     if doc["data"][:4] != b"%PDF":
         return {"status": "NOT_PDF", "source_url": doc["final_url"],
                 "content_type": doc["content_type"],
+                "official_source_verified": False,
+                "identity_verified": False,
                 "note": "La ficha HTML no equivale al PDF judicial."}
     ex = extract_document_text(doc)
     court = detect_court(doc["host"], req.expected_court, ex["full_text"])
@@ -1482,6 +1484,8 @@ async def verify_official_pdf(req: OfficialPdfRequest):
     number_ok = decision_number_matches(ex["full_text"], court, req.expected_number)
     ok = ex["extraction_ok"] and court_ok and number_ok
     return {"status": "PDF_TEXT_VERIFIED" if ok else "PDF_REQUIRES_REVIEW",
+            "official_source_verified": allowed_host(doc["host"]),
+            "identity_verified": bool(ok),
             "court": court, "expected_court_match": court_ok,
             "expected_number_match": number_ok, "text_extraction_ok": ex["extraction_ok"],
             "page_count": ex["page_count"], "source_url": doc["final_url"],
@@ -1489,18 +1493,90 @@ async def verify_official_pdf(req: OfficialPdfRequest):
             "ratio_decidendi_verified": False, "review_required": True,
             "note": "Para cotejar fundamentos concretos utilice readOfficialDecisionExcerpt con páginas específicas."}
 
-@app.post("/v1/analyze-decision", operation_id="analyzeOfficialDecision")
-async def analyze_official_decision(req:AnalyzeDecisionRequest):
+async def _analyze_official_decision(
+    req: AnalyzeDecisionRequest,
+    *,
+    include_document_bytes: bool = False,
+):
     doc=await fetch_document(str(req.url)); ex=extract_document_text(doc); court=detect_court(doc["host"],req.expected_court,ex["full_text"]); meta=extract_metadata_from_text(ex["full_text"],court)
     expected_match=decision_number_matches(ex["full_text"],court,req.expected_number)
     court_ok=court_matches(court,req.expected_court)
     all_foundations = extract_numbered_foundations(ex["pages"], court)
-    passages=find_relevant_passages(ex["pages"],req.legal_issue,req.max_passages,court)
+    official_pdf = (
+        allowed_host(doc["host"])
+        and doc["data"].startswith(b"%PDF")
+        and ex["document_type"] == "PDF"
+    )
+    passages=(
+        find_relevant_passages(ex["pages"],req.legal_issue,req.max_passages,court)
+        if official_pdf and ex["extraction_ok"] else []
+    )
     for passage in passages:
         passage.update(context_for_page(ex["pages"],passage["page"]))
         passage.update(evidence_classification_fields())
-    status="HOLDING_CANDIDATE" if ex["extraction_ok"] and court_ok and expected_match and passages else ("VERIFIED_SOURCE" if ex["extraction_ok"] and court_ok and expected_match else "NOT_VERIFIED")
-    return {"status":status,"official_source_verified":bool(ex["extraction_ok"] and court_ok and expected_match),**evidence_classification_fields(),"expected_court_match":court_ok,"expected_number_match":expected_match,"metadata":meta,"relevant_passages":passages,"extraction_diagnostics":{"numbered_foundations_detected":len(all_foundations),"foundation_numbers_detected":[u["foundation_number"] for u in all_foundations[:100]],"candidate_passages_returned":len(passages),"selection_limit":req.max_passages,"note":"La ausencia de un fundamento en candidatos no prueba su inexistencia en el PDF."},"jurisprudential_card":{"tribunal":court,"sala":meta.get("chamber"),"sentencia":meta.get("decision_number"),"fecha":meta.get("date"),"expediente":meta.get("case_number"),"estado_verificacion":status,"cuestion_juridica":req.legal_issue,"fundamentos_candidatos":passages,"ratio_decidendi":None,"regla_juridica":None,"review_required":True,"fuente_oficial":doc["final_url"],"paginas":ex["page_count"]},"source_url":doc["final_url"],"sha256":doc["sha256"]}
+    identity_verified = bool(
+        official_pdf and ex["extraction_ok"] and court_ok and expected_match
+    )
+    status="HOLDING_CANDIDATE" if identity_verified and passages else ("VERIFIED_SOURCE" if identity_verified else "NOT_VERIFIED")
+    result = {
+        "status": status,
+        "official_source_verified": official_pdf,
+        **evidence_classification_fields(),
+        "source_status": "VERIFIED_SOURCE" if official_pdf else "NOT_VERIFIED",
+        "identity_status": (
+            "VERIFIED_IDENTITY" if identity_verified else "NOT_VERIFIED"
+        ),
+        "document_type": ex["document_type"],
+        "page_count": ex["page_count"],
+        "expected_court_match": court_ok,
+        "expected_number_match": expected_match,
+        "metadata": meta,
+        "relevant_passages": passages,
+        "extraction_diagnostics": {
+            "numbered_foundations_detected": len(all_foundations),
+            "foundation_numbers_detected": [
+                unit["foundation_number"] for unit in all_foundations[:100]
+            ],
+            "candidate_passages_returned": len(passages),
+            "selection_limit": req.max_passages,
+            "document_type": ex["document_type"],
+            "page_count": ex["page_count"],
+            "note": (
+                "La ausencia de un fundamento en candidatos no prueba su "
+                "inexistencia en el PDF."
+            ),
+        },
+        "jurisprudential_card": {
+            "tribunal": court,
+            "sala": meta.get("chamber"),
+            "sentencia": meta.get("decision_number"),
+            "fecha": meta.get("date"),
+            "expediente": meta.get("case_number"),
+            "estado_verificacion": status,
+            "cuestion_juridica": req.legal_issue,
+            "fundamentos_candidatos": passages,
+            "ratio_decidendi": None,
+            "regla_juridica": None,
+            "review_required": True,
+            "fuente_oficial": doc["final_url"],
+            "paginas": ex["page_count"],
+        },
+        "source_url": doc["final_url"],
+        "sha256": doc["sha256"],
+    }
+    if include_document_bytes:
+        if not identity_verified:
+            raise HTTPException(
+                422, "No se persiste un PDF sin fuente e identidad verificadas."
+            )
+        result["_verified_document_bytes"] = doc["data"]
+    return result
+
+
+@app.post("/v1/analyze-decision", operation_id="analyzeOfficialDecision")
+async def analyze_official_decision(req: AnalyzeDecisionRequest):
+    return await _analyze_official_decision(req)
+
 
 @app.post("/v1/decision-excerpt", operation_id="readOfficialDecisionExcerpt")
 async def read_official_decision_excerpt(req: DecisionExcerptRequest):
@@ -1627,7 +1703,11 @@ async def promote_verified_holding(req:HoldingPromotionRequest):
     return {"status":"HOLDING_REQUIRES_INDEPENDENT_LEGAL_REVIEW" if ok else "HOLDING_NOT_PROMOTED",**evidence_classification_fields(),"court":court,"metadata":meta,"legal_issue":req.legal_issue,"legal_proposition":None,"support":{"page":req.support_page,"quote":req.support_quote if support_exact else None,"outcome_page":req.outcome_page,"outcome_quote":req.outcome_quote if outcome_ok else None},"gates":gates,"reasons":reasons,"verification_note":"La verificación documental y los indicadores de atribución no prueban por sí mismos la ratio decidendi. Requiere juicio jurídico humano y cotejo del dispositivo.","source_url":doc["final_url"],"sha256":doc["sha256"]}
 
 # Registro persistente de fuentes verificadas.
-from registry import router as registry_router
+from registry import (
+    find_verified_decisions,
+    get_verified_document,
+    router as registry_router,
+)
 app.include_router(registry_router)
 
 # Acceso individual y administración restringida a identidades bootstrap.
@@ -1638,7 +1718,12 @@ from registry_promotion import router as registry_promotion_router
 app.include_router(registry_promotion_router)
 from juris_163 import install
 install(app)
-from juris_164 import install as install_164
+from juris_164 import (
+    FoundationExtractionRequest,
+    extract_decision_passages,
+    install as install_164,
+    search_scj_candidates,
+)
 install_164(app)
 
 
@@ -1671,7 +1756,15 @@ from mcp_server import install_mcp
 install_mcp(
     app,
     search_tc=search_tc_recovery,
+    search_scj=search_scj_candidates,
     prepare_scj=prepare_scj_search,
     verify_document=verify_document,
+    resolve_official_pdf=resolve_official_pdf,
+    verify_official_pdf=verify_official_pdf,
+    official_pdf_request_model=OfficialPdfRequest,
+    extract_passages=extract_decision_passages,
+    foundation_request_model=FoundationExtractionRequest,
+    find_verified_decisions=find_verified_decisions,
+    get_verified_document=get_verified_document,
     verify_request_model=VerifyRequest,
 )

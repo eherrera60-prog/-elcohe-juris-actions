@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse
 
@@ -121,8 +122,16 @@ def install_mcp(
     app,
     *,
     search_tc,
+    search_scj,
     prepare_scj,
     verify_document,
+    resolve_official_pdf,
+    verify_official_pdf,
+    official_pdf_request_model,
+    extract_passages,
+    foundation_request_model,
+    find_verified_decisions,
+    get_verified_document,
     verify_request_model,
 ) -> None:
     @mcp.tool()
@@ -141,7 +150,41 @@ def install_mcp(
         limit: int = 10,
     ) -> dict:
         """Busca candidatos de decisiones del Tribunal Constitucional mediante el servicio REST existente."""
+        if not 2 <= len(q.strip()) <= 240 or not 1 <= limit <= 20:
+            raise ValueError("q debe tener entre 2 y 240 caracteres y limit entre 1 y 20.")
         return await search_tc(q=q, year=year, limit=limit)
+
+    @mcp.tool()
+    async def search_scj_decisions(
+        q: str,
+        chamber: str | None = None,
+        matter: str | None = None,
+        year_from: int | None = None,
+        year_to: int | None = None,
+        limit: int = 10,
+    ) -> dict:
+        """Ejecuta la búsqueda oficial SCJ; los resultados son candidatos, no decisiones verificadas."""
+        if not 2 <= len(q.strip()) <= 240 or not 1 <= limit <= 20:
+            raise ValueError("q debe tener entre 2 y 240 caracteres y limit entre 1 y 20.")
+        result = await search_scj(
+            q=q,
+            chamber=chamber,
+            matter=matter,
+            year_from=year_from,
+            year_to=year_to,
+            limit=limit,
+        )
+        return {
+            **result,
+            "candidate_located": bool(result.get("results")),
+            "document_recovered": False,
+            "official_source_verified": False,
+            "source_status": "NOT_VERIFIED",
+            "identity_status": "NOT_VERIFIED",
+            "passage_status": "NOT_VERIFIED",
+            "ratio_decidendi_verified": False,
+            "review_required": True,
+        }
 
     @mcp.tool()
     def prepare_scj_search(
@@ -161,6 +204,287 @@ def install_mcp(
         )
 
     @mcp.tool()
+    async def recover_official_pdf(
+        url: str,
+        expected_court: str,
+        expected_number: str,
+    ) -> dict:
+        """Localiza un PDF en una ficha oficial, lo recupera y verifica separadamente fuente e identidad."""
+        request = official_pdf_request_model(
+            url=url,
+            expected_court=expected_court,
+            expected_number=expected_number,
+        )
+        resolution = await resolve_official_pdf(request)
+        candidates = resolution.get("candidates") or []
+        if not candidates:
+            return {
+                "status": resolution.get("status", "PDF_NOT_DISCOVERED"),
+                "candidate_located": False,
+                "document_recovered": False,
+                "official_source_verified": False,
+                "source_status": "NOT_VERIFIED",
+                "identity_verified": False,
+                "identity_status": "NOT_VERIFIED",
+                "passage_status": "NOT_VERIFIED",
+                "resolution": resolution,
+                "candidate_count": 0,
+                "attempts": [],
+                "review_required": True,
+            }
+
+        attempts = []
+        for candidate_url in candidates[:3]:
+            candidate_request = official_pdf_request_model(
+                url=candidate_url,
+                expected_court=expected_court,
+                expected_number=expected_number,
+            )
+            result = await verify_official_pdf(candidate_request)
+            attempt = {
+                "candidate_url": candidate_url,
+                "status": result.get("status"),
+                "document_type": result.get("document_type"),
+                "page_count": result.get("page_count"),
+                "official_source_verified": result.get(
+                    "official_source_verified", False
+                ),
+                "identity_verified": result.get("identity_verified", False),
+                "sha256_pdf": result.get("sha256_pdf"),
+            }
+            attempts.append(attempt)
+            if result.get("identity_verified"):
+                return {
+                    "status": "IDENTITY_VERIFIED",
+                    "candidate_located": True,
+                    "document_recovered": True,
+                    "official_source_verified": result[
+                        "official_source_verified"
+                    ],
+                    "source_status": (
+                        "VERIFIED_SOURCE"
+                        if result["official_source_verified"]
+                        else "NOT_VERIFIED"
+                    ),
+                    "identity_verified": True,
+                    "identity_status": "VERIFIED_IDENTITY",
+                    "passage_status": "NOT_VERIFIED",
+                    "resolution": resolution,
+                    "candidate_count": len(candidates),
+                    "remaining_candidates_unattempted": (
+                        len(candidates) - len(attempts)
+                    ),
+                    "document": result,
+                    "attempts": attempts,
+                    "review_required": True,
+                }
+
+        last_result = result
+        recovered = any(
+            attempt["document_type"] == "PDF" for attempt in attempts
+        )
+        return {
+            "status": (
+                "DOCUMENT_RECOVERED_IDENTITY_UNVERIFIED"
+                if recovered else "CANDIDATE_LOCATED_NOT_RECOVERED"
+            ),
+            "candidate_located": True,
+            "document_recovered": recovered,
+            "official_source_verified": any(
+                attempt["official_source_verified"] for attempt in attempts
+            ),
+            "source_status": (
+                "VERIFIED_SOURCE"
+                if any(
+                    attempt["official_source_verified"] for attempt in attempts
+                )
+                else "NOT_VERIFIED"
+            ),
+            "identity_verified": False,
+            "identity_status": "NOT_VERIFIED",
+            "passage_status": "NOT_VERIFIED",
+            "resolution": resolution,
+            "candidate_count": len(candidates),
+            "remaining_candidates_unattempted": (
+                len(candidates) - len(attempts)
+            ),
+            "document": last_result,
+            "attempts": attempts,
+            "review_required": True,
+        }
+
+    @mcp.tool()
+    async def extract_decision_passages(
+        url: str,
+        expected_court: str,
+        expected_number: str,
+        legal_issue: str | None = None,
+        limit: int = 12,
+    ) -> dict:
+        """Extrae fundamentos y dispositivo con páginas y contexto desde un PDF oficial revalidado."""
+        request = foundation_request_model(
+            url=url,
+            expected_court=expected_court,
+            expected_number=expected_number,
+            legal_issue=legal_issue,
+            limit=limit,
+        )
+        return await extract_passages(request)
+
+    @mcp.tool()
+    async def propose_ratio_decidendi(
+        url: str,
+        expected_court: str,
+        expected_number: str,
+        legal_issue: str | None = None,
+        limit: int = 12,
+    ) -> dict:
+        """Propone pasajes literales candidatos a ratio; nunca certifica criterio y exige revisión jurídica humana."""
+        request = foundation_request_model(
+            url=url,
+            expected_court=expected_court,
+            expected_number=expected_number,
+            legal_issue=legal_issue,
+            limit=limit,
+        )
+        evidence = await extract_passages(request)
+        if evidence.get("identity_status") != "VERIFIED_IDENTITY":
+            return {
+                "status": "PROPOSAL_UNAVAILABLE_IDENTITY_UNVERIFIED",
+                "search_executed": False,
+                "candidate_located": False,
+                "document_recovered": evidence.get(
+                    "document_recovered", False
+                ),
+                "official_source_verified": (
+                    evidence.get("source_status") == "VERIFIED_SOURCE"
+                ),
+                "source_status": evidence.get("source_status"),
+                "identity_status": evidence.get("identity_status"),
+                "passage_status": evidence.get("passage_status"),
+                "supporting_passages": [],
+                "ratio_candidate_located": False,
+                "proposed_ratio_decidendi": None,
+                "ratio_review_status": "PENDING_HUMAN_REVIEW",
+                "ratio_decidendi_verified": False,
+                "review_required": True,
+            }
+
+        candidates = []
+        for passage in evidence.get("foundations", []):
+            origin = passage.get("reasoning_origin")
+            indicators = passage.get("origin_classification_indicators", [])
+            attribution = passage.get("attribution")
+            if (
+                passage.get("status") != "VERIFIED_PASSAGE"
+                or attribution != "POSSIBLE_JUDICIAL_REASONING_REVIEW"
+                or origin in {
+                    "PARTY_ARGUMENT",
+                    "LOWER_COURT_QUOTATION",
+                    "CITED_PRECEDENT",
+                    "CITED_PRECEDENT_OR_MIXED_REVIEW",
+                    "NON_DECIDING_SECTION",
+                }
+                or "explicit_precedent_reference" in indicators
+            ):
+                continue
+            candidates.append(passage)
+
+        proposed = None
+        if candidates:
+            passage = candidates[0]
+            proposed = {
+                "formulation": (
+                    f"Valorar si el fundamento {passage.get('foundation_number')} "
+                    f"de {passage.get('tribunal')} expresa la regla decisoria: "
+                    f"«{passage['passage']}»"
+                ),
+                "formulation_basis": "VERBATIM_VERIFIED_PASSAGE",
+                "decision_court": passage.get("tribunal"),
+                "decision_number": passage.get("decision_number"),
+                "page": passage.get("page"),
+                "foundation_number": passage.get("foundation_number"),
+                "reasoning_origin": passage.get("reasoning_origin"),
+                "attribution_verified": False,
+            }
+        return {
+            "status": (
+                "PROVISIONAL_RATIO_CANDIDATE"
+                if proposed else "NO_ATTRIBUTABLE_PASSAGE_CANDIDATE"
+            ),
+            "search_executed": False,
+            "candidate_located": False,
+            "document_recovered": evidence.get("document_recovered", True),
+            "official_source_verified": (
+                evidence.get("source_status") == "VERIFIED_SOURCE"
+            ),
+            "source_status": evidence.get("source_status"),
+            "identity_status": evidence.get("identity_status"),
+            "passage_status": evidence.get("passage_status"),
+            "decision_court": evidence.get("deciding_court"),
+            "decision_number": (evidence.get("metadata") or {}).get(
+                "decision_number"
+            ),
+            "ratio_candidate_located": bool(candidates),
+            "proposed_ratio_decidendi": proposed,
+            "supporting_passages": candidates,
+            "ratio_review_status": "PENDING_HUMAN_REVIEW",
+            "ratio_decidendi_verified": False,
+            "review_required": True,
+            "human_review_notice": (
+                "La propuesta es una hipótesis basada en texto literal; la "
+                "autoría judicial y la ratio decidendi requieren revisión "
+                "jurídica humana."
+            ),
+        }
+
+    @mcp.tool()
+    def get_verified_decisions(
+        q: str,
+        court: str | None = None,
+        limit: int = 10,
+    ) -> dict:
+        """Recupera del PostgreSQL existente solo documentos PDF previamente verificados."""
+        if court is not None and court not in {"SCJ", "TC"}:
+            raise ValueError("court debe ser SCJ o TC.")
+        if not q.strip():
+            raise ValueError("q no puede estar vacío.")
+        items = find_verified_decisions(q=q, court=court, limit=limit)
+        return {
+            "status": "VERIFIED_DOCUMENTS_FOUND" if items else "NO_VERIFIED_DOCUMENTS",
+            "query": q,
+            "items": items,
+            "count": len(items),
+            "search_executed": True,
+            "candidate_located": bool(items),
+            "document_recovered": False,
+            "official_source_verified": bool(items),
+            "identity_status": (
+                "VERIFIED_IDENTITY" if items else "NOT_VERIFIED"
+            ),
+            "passage_status": "NOT_VERIFIED",
+            "retrieval_mode": "POSTGRESQL_VERIFIED_DOCUMENTS",
+        }
+
+    @mcp.tool()
+    def get_verified_decision_document(decision_id: int) -> dict:
+        """Recupera bytes PDF almacenados en PostgreSQL tras verificar nuevamente su SHA-256."""
+        document = get_verified_document(decision_id)
+        document_bytes = document.pop("document_bytes")
+        document.update({
+            "status": "DOCUMENT_RECOVERED_FROM_POSTGRESQL",
+            "search_executed": False,
+            "candidate_located": True,
+            "official_source_verified": True,
+            "identity_verified": True,
+        })
+        document["document_bytes_base64"] = base64.b64encode(
+            document_bytes
+        ).decode("ascii")
+        document["retrieval_mode"] = "POSTGRESQL_PERSISTED_PDF"
+        return document
+
+    @mcp.tool()
     async def verify_official_document(
         url: str,
         expected_court: str | None = None,
@@ -172,7 +496,25 @@ def install_mcp(
             expected_court=expected_court,
             expected_number=expected_number,
         )
-        return await verify_document(request)
+        result = await verify_document(request)
+        identity_verified = bool(
+            expected_court
+            and expected_number
+            and result.get("expected_court_match")
+            and result.get("expected_number_match")
+        )
+        return {
+            **result,
+            "document_recovered": result.get("document_type") == "PDF",
+            "official_source_verified": bool(result.get("official_domain")),
+            "identity_verified": identity_verified,
+            "identity_status": (
+                "VERIFIED_IDENTITY" if identity_verified else "NOT_VERIFIED"
+            ),
+            "passage_status": "NOT_VERIFIED",
+            "ratio_decidendi_verified": False,
+            "review_required": True,
+        }
 
     mcp_app = mcp.streamable_http_app(
         json_response=True,

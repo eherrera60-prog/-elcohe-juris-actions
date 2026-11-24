@@ -377,7 +377,11 @@ def test_verified_tc_reference_persists_integrity_identity_text_and_pages_withou
     ):
         result = asyncio.run(register_tc_reference(request))
 
-    insert = cursor.execute.call_args.args[0]
+    insert = next(
+        call.args[0]
+        for call in cursor.execute.call_args_list
+        if "INSERT INTO elcohe_decisions" in call.args[0]
+    )
     assert "ON CONFLICT (court,decision_number,sha256) DO NOTHING" in insert
     assert "'VERIFIED_SOURCE',TRUE,FALSE" in insert
     assert result["status"] == "STORED_VERIFIED_SOURCE"
@@ -387,9 +391,20 @@ def test_verified_tc_reference_persists_integrity_identity_text_and_pages_withou
     assert result["sha256_pdf"] == document["sha256"]
     assert result["ratio_decidendi_verified"] is False
     assert result["review_required"] is True
-    metadata = cursor.execute.call_args.args[1][-2]
+    metadata_call = next(
+        call
+        for call in cursor.execute.call_args_list
+        if "INSERT INTO elcohe_decisions" in call.args[0]
+    )
+    metadata = metadata_call.args[1][-2]
     assert metadata.obj["document_type"] == "PDF"
     assert metadata.obj["source_sha256"] == document["sha256"]
+    blob = next(
+        call
+        for call in cursor.execute.call_args_list
+        if "INSERT INTO elcohe_decision_documents" in call.args[0]
+    )
+    assert document["data"] in blob.args[1]
 
 
 def test_duplicate_verified_tc_reference_is_not_inserted_twice():
@@ -416,8 +431,13 @@ def test_duplicate_verified_tc_reference_is_not_inserted_twice():
 
     assert result["status"] == "ALREADY_VERIFIED_SOURCE"
     assert result["deduplicated"] is True
-    assert cursor.execute.call_count == 3
-    assert "ratio_decidendi_verified=FALSE" in cursor.execute.call_args.args[0]
+    assert cursor.execute.call_count == 4
+    update = next(
+        call.args[0]
+        for call in cursor.execute.call_args_list
+        if call.args[0].lstrip().startswith("UPDATE elcohe_decisions")
+    )
+    assert "ratio_decidendi_verified=FALSE" in update
 
 
 def test_tc_reference_rejects_mismatched_document_number():

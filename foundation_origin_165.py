@@ -72,6 +72,19 @@ def classify_contextual_origin(unit):
             )
             break
 
+    if re.search(
+        r"\b(?:precedentes?|jurisprudencia|cita(?:da|do|das|dos)?\s+"
+        r"(?:una\s+)?sentencia)\b",
+        normalized,
+        re.I,
+    ):
+        base["origin_classification_indicators"] = list(dict.fromkeys(
+            base["origin_classification_indicators"]
+            + ["explicit_precedent_reference"]
+        ))
+        if base["reasoning_origin"] == "UNDETERMINED":
+            base["reasoning_origin"] = "CITED_PRECEDENT_OR_MIXED_REVIEW"
+
     base["origin_verified"] = False
     base["origin_review_required"] = True
 
