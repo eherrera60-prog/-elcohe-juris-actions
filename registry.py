@@ -6,6 +6,7 @@ from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field, HttpUrl
+from decision_number import OfficialDecisionNumber
 from auth_access import (
     connect_db as connect,
     require_active_user,
@@ -18,7 +19,7 @@ require_read_access = require_active_user
 class RegisterRequest(BaseModel):
     url: HttpUrl
     expected_court: str = Field(pattern=r"^(SCJ|TC)$")
-    expected_number: str = Field(min_length=4, max_length=80)
+    expected_number: OfficialDecisionNumber
     legal_issue: str | None = Field(default=None, max_length=500)
     max_passages: int = Field(default=6, ge=1, le=12)
 
@@ -525,7 +526,12 @@ async def register_decision(req: RegisterRequest):
     meta = analysis.get("metadata") or {}
     court = analysis["jurisprudential_card"]["tribunal"]
     number = meta.get("decision_number")
-    if court != req.expected_court or not number or number.casefold() != req.expected_number.casefold():
+    if (
+        court != req.expected_court
+        or not number
+        or analysis.get("expected_court_match") is not True
+        or analysis.get("expected_number_match") is not True
+    ):
         raise HTTPException(422, "Tribunal o número no coinciden con el documento.")
     digest = analysis.get("sha256", "")
     if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):

@@ -7,11 +7,13 @@ import re
 from fastapi import HTTPException
 from pydantic import BaseModel, HttpUrl, Field
 
+from decision_number import OfficialDecisionNumber
+
 class IntegratedResearchRequest(BaseModel):
     legal_issue: str = Field(min_length=3, max_length=300)
     court: str = Field(default="TC", pattern="^(TC|SCJ)$")
     official_pdf_url: HttpUrl | None = None
-    expected_number: str | None = Field(default=None, max_length=40)
+    expected_number: OfficialDecisionNumber | None = None
     year: int | None = Field(default=None, ge=2012, le=2100)
     max_candidates: int = Field(default=3, ge=1, le=5)
     max_passages: int = Field(default=8, ge=1, le=12)

@@ -10,6 +10,7 @@ from fastapi.openapi.utils import get_openapi
 from pydantic import BaseModel, HttpUrl, Field
 from pypdf import PdfReader
 from auth_access import require_active_user, require_admin, router as access_router
+from decision_number import OfficialDecisionNumber
 
 APP_VERSION = "1.6.5"
 MAX_DOCUMENT_BYTES = 12 * 1024 * 1024
@@ -49,12 +50,12 @@ app = FastAPI(
 class VerifyRequest(BaseModel):
     url: HttpUrl
     expected_court: str | None = None
-    expected_number: str | None = None
+    expected_number: OfficialDecisionNumber | None = None
 
 class AnalyzeDecisionRequest(BaseModel):
     url: HttpUrl
     expected_court: str | None = None
-    expected_number: str | None = None
+    expected_number: OfficialDecisionNumber | None = None
     legal_issue: str | None = None
     max_passages: int = Field(default=6, ge=1, le=12)
 
@@ -62,7 +63,7 @@ class DecisionExcerptRequest(BaseModel):
     """Retrieve bounded, page-anchored text from an official judgment."""
     url: HttpUrl
     expected_court: str
-    expected_number: str
+    expected_number: OfficialDecisionNumber
     page: int = Field(ge=1)
     query: str | None = Field(default=None, min_length=3, max_length=180)
     max_chars: int = Field(default=5000, ge=200, le=10000)
@@ -70,7 +71,7 @@ class DecisionExcerptRequest(BaseModel):
 class HoldingPromotionRequest(BaseModel):
     url: HttpUrl
     expected_court: str
-    expected_number: str | None = None
+    expected_number: OfficialDecisionNumber | None = None
     legal_issue: str
     legal_proposition: str = Field(min_length=20, max_length=2000)
     support_quote: str = Field(min_length=40, max_length=1800)
@@ -1416,7 +1417,7 @@ async def verify_document(req:VerifyRequest):
 class OfficialPdfRequest(BaseModel):
     url: HttpUrl
     expected_court: str
-    expected_number: str
+    expected_number: OfficialDecisionNumber
 
 @app.post("/v1/resolve-official-pdf", operation_id="resolveOfficialPdf")
 async def resolve_official_pdf(req: OfficialPdfRequest):

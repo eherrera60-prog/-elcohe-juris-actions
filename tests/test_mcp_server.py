@@ -182,6 +182,29 @@ def test_mcp_initializes_over_streamable_http_and_discovers_tools(client):
         "legal_issue",
         "max_passages",
     }
+    number_schema = tool_map["register_verified_decision"]["inputSchema"][
+        "properties"
+    ]["expected_number"]
+    rest_number_schema = app.openapi()["components"]["schemas"][
+        "VerifyRequest"
+    ]["properties"]["expected_number"]["anyOf"][0]
+    assert number_schema["minLength"] == 1
+    assert number_schema["maxLength"] == 80
+    assert "\\d{1,5}" in number_schema["pattern"]
+    assert {
+        key: number_schema[key] for key in ("minLength", "maxLength", "pattern")
+    } == {
+        key: rest_number_schema[key]
+        for key in ("minLength", "maxLength", "pattern")
+    }
+    for tool_name in (
+        "recover_official_pdf",
+        "extract_decision_passages",
+        "propose_ratio_decidendi",
+    ):
+        assert tool_map[tool_name]["inputSchema"]["properties"][
+            "expected_number"
+        ] == number_schema
     assert tool_map["search_tc_decisions"]["inputSchema"]["required"] == ["q"]
     assert tool_map["prepare_scj_search"]["inputSchema"]["required"] == ["q"]
     assert tool_map["verify_official_document"]["inputSchema"]["required"] == ["url"]
@@ -329,6 +352,38 @@ def test_mcp_rejects_missing_arguments_and_unknown_tool(client):
     assert "validation error" in missing.json()["result"]["content"][0]["text"].lower()
     assert unknown.status_code == 200
     assert unknown.json()["result"]["isError"] is True
+
+
+def test_mcp_returns_controlled_error_for_invalid_decision_number(client):
+    with patch(
+        "mcp_server.auth_access.require_active_user",
+        new=AsyncMock(return_value={"sub": "test", "role": "user"}),
+    ):
+        response = client.post(
+            "/mcp",
+            headers={
+                "Authorization": "Bearer test-token",
+                "Accept": "application/json, text/event-stream",
+            },
+            json={
+                "jsonrpc": "2.0",
+                "id": 22,
+                "method": "tools/call",
+                "params": {
+                    "name": "verify_official_document",
+                    "arguments": {
+                        "url": "https://example.test/decision.pdf",
+                        "expected_court": "SCJ",
+                        "expected_number": "sentencia desconocida",
+                    },
+                },
+            },
+        )
+
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert result["isError"] is True
+    assert "expected_number" in result["content"][0]["text"]
 
 
 def _call_mcp(client, name, arguments, request_id):

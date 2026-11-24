@@ -10,6 +10,8 @@ from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field, HttpUrl
 
+from decision_number import OfficialDecisionNumber
+
 SCJ_SEARCH_URL = "https://consultasentenciascj.poderjudicial.gob.do/Home/GetExpedientes"
 SCJ_ARCHIVE_SEARCH_URL = "https://poderjudicial.gob.do/"
 MAX_SCJ_RESPONSE_BYTES = 2 * 1024 * 1024
@@ -20,7 +22,7 @@ MAX_SCJ_ARCHIVE_ARTICLES = 12
 class FoundationExtractionRequest(BaseModel):
     url: HttpUrl
     expected_court: str = Field(pattern=r"^(TC|SCJ)$")
-    expected_number: str = Field(min_length=1, max_length=40)
+    expected_number: OfficialDecisionNumber
     legal_issue: str | None = Field(default=None, min_length=3, max_length=300)
     limit: int = Field(default=12, ge=1, le=30)
 

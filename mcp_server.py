@@ -15,6 +15,7 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 import auth_access
+from decision_number import OfficialDecisionNumber
 
 
 APP_VERSION = "1.6.5"
@@ -335,7 +336,7 @@ def install_mcp(
     async def recover_official_pdf(
         url: str,
         expected_court: str,
-        expected_number: str,
+        expected_number: OfficialDecisionNumber,
     ) -> dict:
         """Localiza un PDF en una ficha oficial, lo recupera y verifica separadamente fuente e identidad."""
         request = official_pdf_request_model(
@@ -445,7 +446,7 @@ def install_mcp(
     async def extract_decision_passages(
         url: str,
         expected_court: str,
-        expected_number: str,
+        expected_number: OfficialDecisionNumber,
         legal_issue: str | None = None,
         limit: int = 12,
     ) -> dict:
@@ -463,7 +464,7 @@ def install_mcp(
     async def propose_ratio_decidendi(
         url: str,
         expected_court: str,
-        expected_number: str,
+        expected_number: OfficialDecisionNumber,
         legal_issue: str | None = None,
         limit: int = 12,
     ) -> dict:
@@ -557,7 +558,7 @@ def install_mcp(
     async def register_verified_decision(
         url: str,
         expected_court: str,
-        expected_number: str,
+        expected_number: OfficialDecisionNumber,
         legal_issue: str | None = None,
         max_passages: int = 6,
     ) -> dict:
@@ -633,7 +634,7 @@ def install_mcp(
     async def verify_official_document(
         url: str,
         expected_court: str | None = None,
-        expected_number: str | None = None,
+        expected_number: OfficialDecisionNumber | None = None,
     ) -> dict:
         """Verifica una fuente oficial mediante el endpoint REST existente; no determina la ratio decidendi."""
         request = verify_request_model(
