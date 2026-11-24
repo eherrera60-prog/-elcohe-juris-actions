@@ -111,6 +111,7 @@ def test_mcp_initializes_over_streamable_http_and_discovers_tools(client):
         "recover_official_pdf",
         "extract_decision_passages",
         "propose_ratio_decidendi",
+        "register_verified_decision",
         "get_verified_decisions",
         "get_verified_decision_document",
         "verify_official_document",
@@ -171,6 +172,15 @@ def test_mcp_initializes_over_streamable_http_and_discovers_tools(client):
         "url",
         "expected_court",
         "expected_number",
+    }
+    assert set(
+        tool_map["register_verified_decision"]["inputSchema"]["properties"]
+    ) == {
+        "url",
+        "expected_court",
+        "expected_number",
+        "legal_issue",
+        "max_passages",
     }
     assert tool_map["search_tc_decisions"]["inputSchema"]["required"] == ["q"]
     assert tool_map["prepare_scj_search"]["inputSchema"]["required"] == ["q"]
@@ -351,7 +361,7 @@ PRIMERA SALA DE LA SUPREMA CORTE DE JUSTICIA
 SENTENCIA SCJ-TS-24-00123
 En fecha 4 de marzo de 2024.
 LA SALA, DESPUÉS DE HABER DELIBERADO, CONSIDERA QUE:
-1) Esta Suprema Corte establece que la interpretación debe atender el caso concreto.
+1) Esta Suprema Corte establece que la interpretación debe atender el caso concreto. En consecuencia, rechaza el recurso de casación.
 FALLA:
 ÚNICO: RECHAZA el recurso de casación.
 """
@@ -479,7 +489,7 @@ FALLA:
         proposal = _call_mcp(
             client,
             "propose_ratio_decidendi",
-            {**request, "legal_issue": "interpretación jurídica"},
+            {**request, "legal_issue": "interpretación del caso concreto"},
             33,
         )
 
@@ -495,6 +505,9 @@ FALLA:
     assert "Esta Suprema Corte establece" in proposal[
         "proposed_ratio_decidendi"
     ]["formulation"]
+    assert proposal["proposed_ratio_decidendi"]["dispositive_relationship"] == (
+        "SHARED_TEXT_WITH_VERIFIED_DISPOSITIVE"
+    )
 
 
 def test_mcp_ratio_proposal_rejects_wrong_identity_and_mixed_sources(client):
@@ -591,6 +604,308 @@ def test_mcp_ratio_proposal_rejects_wrong_identity_and_mixed_sources(client):
     assert mismatch["status"] == "PROPOSAL_UNAVAILABLE_IDENTITY_UNVERIFIED"
     assert mismatch["identity_status"] == "NOT_VERIFIED"
     assert mismatch["proposed_ratio_decidendi"] is None
+
+
+def test_mcp_ratio_proposal_requires_issue_relevance_and_decisional_link():
+    from mcp_server import _rank_ratio_candidates
+
+    evidence = {
+        "identity_status": "VERIFIED_IDENTITY",
+        "source_status": "VERIFIED_SOURCE",
+        "passage_status": "VERIFIED_PASSAGE",
+        "document_recovered": True,
+        "deciding_court": "Tribunal Constitucional",
+        "metadata": {"decision_number": "TC/0019/24"},
+        "dispositive": {
+            "status": "VERIFIED_PASSAGE",
+            "text": "DECIDE: ACOGER el recurso y ANULAR la sentencia recurrida.",
+        },
+        "foundations": [
+            {
+                "status": "VERIFIED_PASSAGE",
+                "attribution": "POSSIBLE_JUDICIAL_REASONING_REVIEW",
+                "reasoning_origin": "UNDETERMINED",
+                "origin_classification_indicators": ["court_self_reference"],
+                "foundation_number": "8",
+                "tribunal": "Tribunal Constitucional",
+                "decision_number": "TC/0019/24",
+                "page": 18,
+                "passage": (
+                    "8. Competencia. Este tribunal es competente para conocer "
+                    "del recurso de revisión constitucional de decisión "
+                    "jurisdiccional conforme a la Constitución y la ley."
+                ),
+            },
+            {
+                "status": "VERIFIED_PASSAGE",
+                "attribution": "PARTY_ARGUMENT_OR_MIXED_REVIEW",
+                "reasoning_origin": "PARTY_ARGUMENT",
+                "origin_classification_indicators": [],
+                "foundation_number": "10",
+                "tribunal": "Tribunal Constitucional",
+                "decision_number": "TC/0019/24",
+                "page": 20,
+                "passage": (
+                    "El recurrente alega que la reforma de la pena en su "
+                    "perjuicio vulneró sus garantías procesales."
+                ),
+            },
+            {
+                "status": "VERIFIED_PASSAGE",
+                "attribution": "DECIDING_COURT_SECTION_REVIEW",
+                "reasoning_origin": "UNDETERMINED",
+                "origin_classification_indicators": [
+                    "tc_own_considerations_section",
+                    "requires_individual_review",
+                ],
+                "attribution_verified": False,
+                "review_required": True,
+                "foundation_number": "12",
+                "tribunal": "Tribunal Constitucional",
+                "decision_number": "TC/0019/24",
+                "page": 23,
+                "passage": (
+                    "El Tribunal Constitucional considera que la prohibición "
+                    "de reforma en perjuicio del imputado debe aplicarse en "
+                    "el proceso penal. En consecuencia, acoge el recurso y "
+                    "anula la sentencia impugnada por esa razón."
+                ),
+            },
+        ],
+    }
+    candidates = _rank_ratio_candidates(
+        evidence, "prohibición de reforma en perjuicio del imputado"
+    )
+
+    assert [item["foundation_number"] for item in candidates] == ["12"]
+    assert candidates[0]["issue_relevance"] == 1.0
+    assert candidates[0]["dispositive_relationship"] == (
+        "DECISIONAL_LINK_REQUIRES_HUMAN_REVIEW"
+    )
+    assert candidates[0]["attribution_verified"] is False
+    assert candidates[0]["review_required"] is True
+
+
+def test_mcp_registration_uses_existing_tc_registry_and_requires_admin(client):
+    request = {
+        "url": (
+            "https://tribunalsitestorage.blob.core.windows.net/"
+            "media/tc-0019-24.pdf"
+        ),
+        "expected_court": "TC",
+        "expected_number": "TC/0019/24",
+        "legal_issue": "reforma en perjuicio",
+    }
+    headers = {
+        "Authorization": "Bearer test-token",
+        "Accept": "application/json, text/event-stream",
+    }
+    with patch(
+        "mcp_server.auth_access.require_active_user",
+        new=AsyncMock(return_value={"sub": "test-user", "role": "user"}),
+    ):
+        denied = client.post(
+            "/mcp",
+            headers=headers,
+            json={
+                "jsonrpc": "2.0",
+                "id": 46,
+                "method": "tools/call",
+                "params": {
+                    "name": "register_verified_decision",
+                    "arguments": request,
+                },
+            },
+        )
+    assert denied.json()["result"]["isError"] is True
+
+    from datetime import datetime, timezone
+
+    document_bytes = b"%PDF-1.7 authorized TC fixture"
+    digest = hashlib.sha256(document_bytes).hexdigest()
+    connection = MagicMock()
+    connection.__enter__.return_value = connection
+    cursor = MagicMock()
+    cursor.__enter__.return_value = cursor
+    cursor.fetchone.return_value = (19, datetime.now(timezone.utc))
+    connection.cursor.return_value = cursor
+    document = {
+        "final_url": request["url"],
+        "host": "tribunalsitestorage.blob.core.windows.net",
+        "content_type": "application/pdf",
+        "data": document_bytes,
+        "sha256": digest,
+    }
+    extracted = {
+        "document_type": "PDF",
+        "pages": [{
+            "page": 1,
+            "text": (
+                "TRIBUNAL CONSTITUCIONAL SENTENCIA TC/0019/24 "
+                + "texto judicial verificado. " * 8
+            ),
+        }],
+        "full_text": (
+            "TRIBUNAL CONSTITUCIONAL SENTENCIA TC/0019/24 "
+            + "texto judicial verificado. " * 8
+        ),
+        "page_count": 1,
+        "extraction_ok": True,
+    }
+    with (
+        patch(
+            "mcp_server.auth_access.require_active_user",
+            new=AsyncMock(return_value={"sub": "test-admin", "role": "admin"}),
+        ),
+        patch("registry.connect", return_value=connection),
+        patch("registry.init_schema"),
+        patch("app.fetch_document", new=AsyncMock(return_value=document)),
+        patch("app.extract_document_text", return_value=extracted),
+        patch("app.detect_court", return_value="TC"),
+        patch("app.court_matches", return_value=True),
+        patch("app.decision_number_matches", return_value=True),
+        patch(
+            "app.extract_metadata_from_text",
+            return_value={"decision_number": "TC/0019/24"},
+        ),
+    ):
+        stored = _call_mcp(client, "register_verified_decision", request, 47)
+
+    assert stored["status"] == "STORED_VERIFIED_SOURCE"
+    assert stored["id"] == 19
+    assert stored["sha256_pdf"] == digest
+    decision_insert = next(
+        call.args[0]
+        for call in cursor.execute.call_args_list
+        if "INSERT INTO elcohe_decisions" in call.args[0]
+    )
+    assert "ON CONFLICT (court,decision_number,sha256) DO NOTHING" in decision_insert
+    document_insert = next(
+        call.args[0]
+        for call in cursor.execute.call_args_list
+        if "INSERT INTO elcohe_decision_documents" in call.args[0]
+    )
+    assert "ON CONFLICT (decision_id) DO UPDATE" in document_insert
+
+
+def test_mcp_verified_search_distinguishes_empty_database_from_unavailable(client):
+    args = {"q": "TC/0019/24", "court": "TC", "limit": 5}
+    fields = [
+        "id", "court", "decision_number", "source_url", "sha256", "chamber",
+        "decision_date", "case_number", "legal_issue", "verification_status",
+        "review_required", "ratio_decidendi_verified", "metadata",
+        "extraction_diagnostics", "created_at",
+    ]
+    connection = MagicMock()
+    connection.__enter__.return_value = connection
+    cursor = MagicMock()
+    cursor.__enter__.return_value = cursor
+    cursor.description = [SimpleNamespace(name=name) for name in fields]
+    cursor.fetchall.return_value = []
+    connection.cursor.return_value = cursor
+    with (
+        patch(
+            "mcp_server.auth_access.require_active_user",
+            new=AsyncMock(return_value={"sub": "test", "role": "user"}),
+        ),
+        patch("registry.connect", return_value=connection),
+        patch("registry.init_schema"),
+    ):
+        empty = _call_mcp(client, "get_verified_decisions", args, 48)
+    assert empty["status"] == "NO_VERIFIED_DOCUMENTS"
+    assert empty["count"] == 0
+
+    with (
+        patch(
+            "mcp_server.auth_access.require_active_user",
+            new=AsyncMock(return_value={"sub": "test", "role": "user"}),
+        ),
+        patch("registry.connect", side_effect=RuntimeError("postgres unavailable")),
+        patch("registry.init_schema"),
+    ):
+        unavailable = client.post(
+            "/mcp",
+            headers={
+                "Authorization": "Bearer test-token",
+                "Accept": "application/json, text/event-stream",
+            },
+            json={
+                "jsonrpc": "2.0",
+                "id": 49,
+                "method": "tools/call",
+                "params": {
+                    "name": "get_verified_decisions",
+                    "arguments": args,
+                },
+            },
+        ).json()["result"]
+    assert unavailable["isError"] is True
+    assert "NO_VERIFIED_DOCUMENTS" not in unavailable["content"][0]["text"]
+
+
+def test_real_tc_0019_24_mcp_proposal_abstains_on_allegations_and_competence(
+    client,
+):
+    with patch(
+        "mcp_server.auth_access.require_active_user",
+        new=AsyncMock(return_value={"sub": "real-tc-test", "role": "user"}),
+    ):
+        result = _call_mcp(
+            client,
+            "propose_ratio_decidendi",
+            {
+                "url": (
+                    "https://tribunalsitestorage.blob.core.windows.net/"
+                    "media/53968/tc-0019-24-tc-04-2023-0274.pdf"
+                ),
+                "expected_court": "TC",
+                "expected_number": "TC/0019/24",
+                "legal_issue": (
+                    "prohibición de reforma en perjuicio del imputado"
+                ),
+                "limit": 30,
+            },
+            501,
+        )
+
+    assert result["identity_status"] == "VERIFIED_IDENTITY"
+    assert result["source_status"] == "VERIFIED_SOURCE"
+    assert result["status"] == "NO_ATTRIBUTABLE_PASSAGE_CANDIDATE"
+    assert result["proposed_ratio_decidendi"] is None
+    assert result["supporting_passages"] == []
+    assert result["ratio_decidendi_verified"] is False
+    assert result["review_required"] is True
+
+
+def test_real_scj_january_2020_number_36_mcp_extraction(client):
+    with patch(
+        "mcp_server.auth_access.require_active_user",
+        new=AsyncMock(return_value={"sub": "real-scj-test", "role": "user"}),
+    ):
+        result = _call_mcp(
+            client,
+            "extract_decision_passages",
+            {
+                "url": (
+                    "https://transparencia.poderjudicial.gob.do/"
+                    "documentos/pdf/BoletinJudicialIndividual/131020036.pdf"
+                ),
+                "expected_court": "SCJ",
+                "expected_number": "36",
+                "legal_issue": "falta de base legal",
+                "limit": 30,
+            },
+            502,
+        )
+
+    assert result["identity_status"] == "VERIFIED_IDENTITY"
+    assert result["source_status"] == "VERIFIED_SOURCE"
+    assert result["metadata"]["decision_number"] == "NÚM. 36"
+    assert result["metadata"]["date"] == "29 de enero de 2020"
+    assert result["metadata"]["chamber"] == "Primera Sala"
+    assert result["dispositive_status"] == "VERIFIED_PASSAGE"
+    assert "FALLA:" in result["dispositive"]["text"]
+    assert result["ratio_decidendi_verified"] is False
 
 
 def test_mcp_recovers_persisted_pdf_after_hash_and_identity_checks(client):

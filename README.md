@@ -170,6 +170,14 @@ pasajes literales que siempre queda pendiente de revisión jurídica humana.
 en PostgreSQL, y `get_verified_decision_document` recupera esos bytes tras
 comprobar nuevamente su SHA-256. La búsqueda, localización, recuperación,
 verificación de fuente, identidad y pasaje se reportan como estados distintos.
+`verify_official_document` solo verifica: no persiste el archivo. Un
+administrador puede registrar explícitamente el documento con
+`register_verified_decision`; la operación reutiliza el registro PostgreSQL
+existente, es idempotente para la misma identidad y SHA-256, y devuelve el
+identificador que se usa en `get_verified_decision_document`. La ausencia de
+coincidencias se informa como `NO_VERIFIED_DOCUMENTS`; los errores de conexión
+o consulta a PostgreSQL se informan como error, no como una lista vacía.
+
 En un workspace de ChatGPT que permita servidores MCP personalizados, agrega
 ese endpoint y configura OAuth con la API Auth0 descrita arriba. Registra en
 Auth0 la URL de callback que muestre ChatGPT y solicita

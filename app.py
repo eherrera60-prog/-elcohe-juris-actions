@@ -1704,8 +1704,12 @@ async def promote_verified_holding(req:HoldingPromotionRequest):
 
 # Registro persistente de fuentes verificadas.
 from registry import (
+    RegisterRequest,
+    TCReferenceRequest,
     find_verified_decisions,
     get_verified_document,
+    register_decision,
+    register_tc_reference,
     router as registry_router,
 )
 app.include_router(registry_router)
@@ -1767,4 +1771,8 @@ install_mcp(
     find_verified_decisions=find_verified_decisions,
     get_verified_document=get_verified_document,
     verify_request_model=VerifyRequest,
+    register_tc_reference=register_tc_reference,
+    tc_reference_request_model=TCReferenceRequest,
+    register_decision=register_decision,
+    register_request_model=RegisterRequest,
 )

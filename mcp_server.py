@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import base64
+import re
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from urllib.parse import urlparse
 
 from fastapi import HTTPException
@@ -30,6 +32,9 @@ mcp = MCPServer(
         "verificar y leer el documento oficial."
     ),
     version=APP_VERSION,
+)
+_authenticated_mcp_user: ContextVar[dict | None] = ContextVar(
+    "authenticated_mcp_user", default=None
 )
 
 
@@ -94,7 +99,7 @@ class MCPAuthMiddleware(BaseHTTPMiddleware):
         token = credentials.strip() if separator and scheme.lower() == "bearer" else None
 
         try:
-            await auth_access.require_active_user(request, token)
+            user = await auth_access.require_active_user(request, token)
         except HTTPException as exc:
             headers = dict(exc.headers or {})
             if exc.status_code == 401:
@@ -115,7 +120,126 @@ class MCPAuthMiddleware(BaseHTTPMiddleware):
                 status_code=exc.status_code,
                 headers=headers,
             )
-        return await call_next(request)
+        user_token = _authenticated_mcp_user.set(user)
+        try:
+            return await call_next(request)
+        finally:
+            _authenticated_mcp_user.reset(user_token)
+
+
+def _rank_ratio_candidates(evidence: dict, legal_issue: str | None) -> list[dict]:
+    from app import fold, tokenize
+
+    issue_tokens = tokenize(legal_issue)
+    dispositive = evidence.get("dispositive") or {}
+    dispositive_text = (
+        dispositive.get("text", "")
+        if dispositive.get("status") == "VERIFIED_PASSAGE"
+        else ""
+    )
+    dispositive_tokens = tokenize(dispositive_text)
+    if not issue_tokens or not dispositive_text:
+        return []
+
+    excluded_origins = {
+        "PARTY_ARGUMENT",
+        "LOWER_COURT_QUOTATION",
+        "CITED_PRECEDENT",
+        "CITED_PRECEDENT_OR_MIXED_REVIEW",
+        "NON_DECIDING_SECTION",
+        "STATUTORY_QUOTATION",
+    }
+    excluded_attributions = (
+        "LOWER_COURT",
+        "PARTY_ARGUMENT",
+        "NON_DECIDING",
+    )
+    outcome_link = re.compile(
+        r"\b(?:por tanto|en consecuencia|por consiguiente|procede|"
+        r"corresponde|se impone|se anula|se casa|se rechaza|"
+        r"se acoge|determina)\b",
+        re.IGNORECASE,
+    )
+    generic_outcome_terms = set().union(*(
+        tokenize(term)
+        for term in (
+            "recurso",
+            "sentencia",
+            "decisión",
+            "tribunal",
+            "casación",
+            "costas",
+            "caso",
+            "demanda",
+            "parte",
+            "proceso",
+        )
+    ))
+    candidates = []
+    for passage in evidence.get("foundations", []):
+        origin = passage.get("reasoning_origin")
+        indicators = passage.get("origin_classification_indicators", [])
+        attribution = passage.get("attribution") or ""
+        text = passage.get("passage", "")
+        normalized_text = fold(text)
+        if (
+            passage.get("status") != "VERIFIED_PASSAGE"
+            or attribution not in {
+                "POSSIBLE_JUDICIAL_REASONING_REVIEW",
+                "DECIDING_COURT_SECTION_REVIEW",
+                "DECIDING_COURT_NARRATIVE_REVIEW",
+            }
+            or origin in excluded_origins
+            or attribution.startswith(excluded_attributions)
+            or "explicit_precedent_reference" in indicators
+            or len(text) < 100
+            or not text.strip()
+            or re.match(
+                r"^\s*\d+(?:\.\d+)*[.)]?\s*"
+                r"(?:s[ií]ntesis del conflicto|antecedentes|"
+                r"relaci[oó]n de hechos|hechos probados)\b",
+                normalized_text,
+            )
+        ):
+            continue
+        passage_tokens = tokenize(text)
+        matched_issue = issue_tokens & passage_tokens
+        minimum_issue_matches = min(2, len(issue_tokens))
+        issue_relevance = len(matched_issue) / len(issue_tokens)
+        if (
+            len(matched_issue) < minimum_issue_matches
+            or issue_relevance < 0.35
+        ):
+            continue
+        shared_outcome = (
+            passage_tokens & dispositive_tokens
+        ) - generic_outcome_terms
+        context = " ".join(
+            (text, passage.get("following_context") or "")
+        )
+        has_decisional_link = bool(outcome_link.search(context))
+        if not shared_outcome and not has_decisional_link:
+            continue
+        candidates.append({
+            **passage,
+            "issue_terms_matched": sorted(matched_issue),
+            "issue_relevance": round(issue_relevance, 3),
+            "dispositive_relationship": (
+                "SHARED_TEXT_WITH_VERIFIED_DISPOSITIVE"
+                if shared_outcome
+                else "DECISIONAL_LINK_REQUIRES_HUMAN_REVIEW"
+            ),
+            "_ranking": (
+                issue_relevance,
+                len(shared_outcome),
+            ),
+        })
+    candidates.sort(key=lambda item: (
+        -item["_ranking"][0], -item["_ranking"][1]
+    ))
+    for candidate in candidates:
+        candidate.pop("_ranking")
+    return candidates
 
 
 def install_mcp(
@@ -133,6 +257,10 @@ def install_mcp(
     find_verified_decisions,
     get_verified_document,
     verify_request_model,
+    register_tc_reference,
+    tc_reference_request_model,
+    register_decision,
+    register_request_model,
 ) -> None:
     @mcp.tool()
     def health_check() -> dict:
@@ -370,25 +498,7 @@ def install_mcp(
                 "review_required": True,
             }
 
-        candidates = []
-        for passage in evidence.get("foundations", []):
-            origin = passage.get("reasoning_origin")
-            indicators = passage.get("origin_classification_indicators", [])
-            attribution = passage.get("attribution")
-            if (
-                passage.get("status") != "VERIFIED_PASSAGE"
-                or attribution != "POSSIBLE_JUDICIAL_REASONING_REVIEW"
-                or origin in {
-                    "PARTY_ARGUMENT",
-                    "LOWER_COURT_QUOTATION",
-                    "CITED_PRECEDENT",
-                    "CITED_PRECEDENT_OR_MIXED_REVIEW",
-                    "NON_DECIDING_SECTION",
-                }
-                or "explicit_precedent_reference" in indicators
-            ):
-                continue
-            candidates.append(passage)
+        candidates = _rank_ratio_candidates(evidence, legal_issue)
 
         proposed = None
         if candidates:
@@ -406,6 +516,11 @@ def install_mcp(
                 "foundation_number": passage.get("foundation_number"),
                 "reasoning_origin": passage.get("reasoning_origin"),
                 "attribution_verified": False,
+                "issue_terms_matched": passage["issue_terms_matched"],
+                "issue_relevance": passage["issue_relevance"],
+                "dispositive_relationship": passage[
+                    "dispositive_relationship"
+                ],
             }
         return {
             "status": (
@@ -437,6 +552,36 @@ def install_mcp(
                 "jurídica humana."
             ),
         }
+
+    @mcp.tool()
+    async def register_verified_decision(
+        url: str,
+        expected_court: str,
+        expected_number: str,
+        legal_issue: str | None = None,
+        max_passages: int = 6,
+    ) -> dict:
+        """Registra explícitamente un PDF oficial verificado en PostgreSQL; operación exclusiva de administradores."""
+        user = _authenticated_mcp_user.get()
+        if not user or user.get("role") != "admin":
+            raise HTTPException(403, "Se requiere permiso administrativo.")
+        if expected_court == "TC":
+            request = tc_reference_request_model(
+                url=url,
+                expected_number=expected_number,
+                legal_issue=legal_issue,
+            )
+            return await register_tc_reference(request)
+        if expected_court != "SCJ":
+            raise ValueError("expected_court debe ser TC o SCJ.")
+        request = register_request_model(
+            url=url,
+            expected_court=expected_court,
+            expected_number=expected_number,
+            legal_issue=legal_issue,
+            max_passages=max_passages,
+        )
+        return await register_decision(request)
 
     @mcp.tool()
     def get_verified_decisions(
