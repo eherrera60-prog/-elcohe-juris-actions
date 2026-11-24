@@ -873,7 +873,11 @@ def find_relevant_passages(pages, issue, limit, court=None):
     # Favor passages mentioning the issue and judicial reasoning. A later
     # numbered ground can be more useful than the first factual background.
     candidates.sort(key=lambda x: (-x["score"], x["page"],
-                                   int(x["foundation_number"].split(".")[0])))
+                                   (
+    int(str(x.get("foundation_number")).split(".")[0])
+    if str(x.get("foundation_number")).split(".")[0].isdigit()
+    else float("inf")
+)))
     out = []
     seen = set()
     for c in candidates:
