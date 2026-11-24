@@ -654,6 +654,57 @@ def test_mcp_recovers_persisted_pdf_after_hash_and_identity_checks(client):
     assert base64.b64decode(recovered["document_bytes_base64"]) == data
 
 
+def test_mcp_searches_verified_decisions_using_registry_signature(client):
+    from datetime import datetime, timezone
+
+    fields = [
+        "id", "court", "decision_number", "source_url", "sha256", "chamber",
+        "decision_date", "case_number", "legal_issue", "verification_status",
+        "review_required", "ratio_decidendi_verified", "metadata",
+        "extraction_diagnostics", "created_at",
+    ]
+    row = (
+        19, "SCJ", "SCJ-PS-20-00036",
+        "https://transparencia.poderjudicial.gob.do/decision.pdf",
+        "a" * 64, "Primera Sala", "2020-01-29", None, "seguro",
+        "VERIFIED_SOURCE", True, False, {"document_type": "PDF"}, {},
+        datetime.now(timezone.utc),
+    )
+    connection = MagicMock()
+    connection.__enter__.return_value = connection
+    cursor = MagicMock()
+    cursor.__enter__.return_value = cursor
+    cursor.description = [SimpleNamespace(name=name) for name in fields]
+    cursor.fetchall.return_value = [row]
+    connection.cursor.return_value = cursor
+
+    with (
+        patch(
+            "mcp_server.auth_access.require_active_user",
+            new=AsyncMock(return_value={"sub": "test", "role": "user"}),
+        ),
+        patch("registry.connect", return_value=connection),
+        patch("registry.init_schema"),
+    ):
+        result = _call_mcp(
+            client,
+            "get_verified_decisions",
+            {"q": "SCJ-PS-20-00036", "court": "SCJ", "limit": 5},
+            44,
+        )
+
+    assert result["status"] == "VERIFIED_DOCUMENTS_FOUND"
+    assert result["count"] == 1
+    assert result["items"][0]["decision_number"] == "SCJ-PS-20-00036"
+    assert cursor.execute.call_args.args[1] == [
+        "SCJ",
+        "%SCJ-PS-20-00036%",
+        "%SCJ-PS-20-00036%",
+        "%SCJ-PS-20-00036%",
+        5,
+    ]
+
+
 def test_mcp_uses_test_resource_audience_without_changing_rest_audience():
     from auth_access import AUTH0_AUDIENCE, REQUIRED_PERMISSION, require_active_user
 

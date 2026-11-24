@@ -449,7 +449,7 @@ def install_mcp(
             raise ValueError("court debe ser SCJ o TC.")
         if not q.strip():
             raise ValueError("q no puede estar vacío.")
-        items = find_verified_decisions(q=q, court=court, limit=limit)
+        items = find_verified_decisions(query=q, court=court, limit=limit)
         return {
             "status": "VERIFIED_DOCUMENTS_FOUND" if items else "NO_VERIFIED_DOCUMENTS",
             "query": q,
