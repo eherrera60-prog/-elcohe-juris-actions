@@ -107,7 +107,7 @@ cuántos se devolvieron.
 
 Todos los endpoints `/v1/*`, incluidos los administrativos, requieren un token
 de acceso Auth0 firmado mediante RS256. Las operaciones jurisprudenciales
-requieren además la audiencia `https://elcohe-juris-163-test.onrender.com`, el
+requieren además la audiencia `https://elcohe-juris-164-final`, el
 permiso `access:jurisprudence` y un usuario con estado `ACTIVE` en PostgreSQL.
 En Auth0, asigna ese permiso al rol `ELCOHE-PROFESIONAL`; la API valida el claim
 estándar `permissions` y no necesita emitir un claim personalizado de roles.
@@ -119,14 +119,14 @@ del esquema público. No se almacenan tokens ni contraseñas.
 Configura Auth0 de la siguiente manera:
 
 1. Crea una API con identificador
-   `https://elcohe-juris-163-test.onrender.com` y firma **RS256**. Habilita RBAC
+   `https://elcohe-juris-164-final` y firma **RS256**. Habilita RBAC
    y la inclusión de permisos en el token de acceso; asigna
    `access:jurisprudence` al rol de API `ELCOHE-PROFESIONAL`.
 2. No hace falta incluir roles en el token: Auth0 añade al claim estándar
    `permissions` los permisos efectivos del rol. El dominio del tenant se
    configura como `AUTH0_DOMAIN` (solo el dominio, o su URL HTTPS); el emisor y
    la URL JWKS `/.well-known/jwks.json` se derivan de ese valor.
-3. En el servicio existente `elcohe-juris-163-test`, configura
+3. En el servicio de pruebas existente, configura
    `AUTH0_DOMAIN`, `DATABASE_URL` y `ELCOHE_BOOTSTRAP_ADMIN_SUBJECTS` sin crear
    otro servicio mediante un manifiesto de Render. `ELCOHE_BOOTSTRAP` se admite
    como alternativa únicamente cuando la variable plural no está definida.
@@ -141,7 +141,7 @@ Configura Auth0 de la siguiente manera:
    a ese administrador bootstrap.
 5. En el editor de GPT, configura **Authentication: OAuth**, el Client ID y el
    Client Secret de Auth0, la URL de autorización
-   `https://<AUTH0_DOMAIN>/authorize?audience=https%3A%2F%2Felcohe-juris-163-test.onrender.com`,
+   `https://<AUTH0_DOMAIN>/authorize?audience=https%3A%2F%2Felcohe-juris-164-final`,
    el endpoint `https://<AUTH0_DOMAIN>/oauth/token` y el scope
    `access:jurisprudence`.
    Registra en Auth0 el callback URL que muestre ChatGPT. No copies el Client
@@ -178,13 +178,30 @@ identificador que se usa en `get_verified_decision_document`. La ausencia de
 coincidencias se informa como `NO_VERIFIED_DOCUMENTS`; los errores de conexión
 o consulta a PostgreSQL se informan como error, no como una lista vacía.
 
-En un workspace de ChatGPT que permita servidores MCP personalizados, agrega
-ese endpoint y configura OAuth con la API Auth0 descrita arriba. Registra en
-Auth0 la URL de callback que muestre ChatGPT y solicita
-`access:jurisprudence offline_access`. Auth0 debe permitir acceso sin conexión
-y emitir refresh tokens para esa aplicación; confirma que su metadata OIDC
-anuncie `offline_access`. ChatGPT renueva el acceso mediante Auth0; ELCOHE-JURIS
-solo valida los access tokens y no almacena refresh tokens ni secretos.
+Para MCP, conserva la API `https://elcohe-juris-164-final` para las rutas `/v1`
+y crea una API Auth0 cuyo identificador sea exactamente el recurso MCP,
+incluido `/mcp` (por ejemplo,
+`https://elcohe-juris-163-test.onrender.com/mcp`). Habilita RBAC y la inclusión
+de permisos en el token, y concede `access:jurisprudence` a esa API. En Auth0,
+activa **Resource Parameter Compatibility Profile** en **Tenant Settings >
+Advanced** para que el `resource` enviado por ChatGPT se convierta en la
+audiencia del token. No añadas un parámetro `audience` distinto a la URL de
+autorización MCP: Auth0 da precedencia a `audience` sobre `resource`.
+
+Usa una aplicación OAuth de usuario que permita **Authorization Code** y
+refresh tokens, no una aplicación exclusivamente Machine-to-Machine. En
+ChatGPT configura la autorización como
+`https://<AUTH0_DOMAIN>/authorize` (sin query `audience`), el token endpoint
+`https://<AUTH0_DOMAIN>/oauth/token`, el scope
+`access:jurisprudence offline_access` y el método de autenticación del token
+`client_secret_post`. En Auth0, agrega a **Allowed Callback URLs** el callback
+de producción exacto mostrado en la configuración del conector. Con la
+metadata Auth0 actual, que anuncia `authorization_response_iss_parameter_supported`,
+ChatGPT usa `https://chatgpt.com/connector_platform_oauth_redirect`; si la
+pantalla del conector muestra otra URL, registra esa URL exacta. La metadata
+OIDC debe anunciar `S256` y `offline_access`, y la aplicación debe poder emitir
+refresh tokens. ChatGPT renueva el acceso mediante Auth0; ELCOHE-JURIS solo
+valida access tokens y no almacena refresh tokens ni secretos.
 
 El `sub` del usuario debe estar autorizado como `ACTIVE` en ELCOHE-JURIS.
 Prueba el descubrimiento y una llamada autenticada en un entorno de
@@ -195,7 +212,7 @@ preproducción antes de publicar la app en el workspace.
 El API acepta tokens M2M y tokens de usuario mediante el mismo bearer JWT; no
 requiere una ruta de autenticación M2M en la aplicación. En Auth0, crea o usa
 una aplicación **Machine to Machine**, autorízala para la API con audiencia
-`https://elcohe-juris-163-test.onrender.com` y concédele
+`https://elcohe-juris-164-final` y concédele
 `access:jurisprudence`. La API debe tener RS256, RBAC y **Add Permissions in
 the Access Token** habilitados. La prueba requiere que el servicio tenga
 configurados `AUTH0_DOMAIN` y `DATABASE_URL`.
@@ -212,6 +229,10 @@ El `sub` M2M (normalmente `<client_id>@clients`) debe además figurar como
 activarlo con `PUT /v1/admin/users/status`. Sin esa fila, un JWT válido con el
 permiso correcto recibe 403. Un token inválido o sin token recibe 401. Una
 respuesta 200 confirma la integración completa contra Auth0 y PostgreSQL.
+Autorizar el `sub` M2M no lo agrega a
+`ELCOHE_BOOTSTRAP_ADMIN_SUBJECTS`: la identidad conserva rol de usuario y no
+puede consultar `/v1/admin/database/health` ni administrar otras identidades.
+Ese endpoint de salud es solo para una identidad administradora autorizada.
 
 Un token ausente o inválido produce HTTP 401; la falta del permiso o de la
 autorización individual produce HTTP 403. El esquema de autorización crea las

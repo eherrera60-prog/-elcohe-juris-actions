@@ -200,6 +200,8 @@ def _scj_candidates(payload: object, allowed_host) -> tuple[list[dict], int] | N
             "official_document_verified": False,
             "ratio_decidendi_verified": False,
         }
+        if canonical_number and canonical_number != number:
+            candidate["reported_decision_number"] = number
         source_fields = {
             "tribunal": row.get("descTribunal"),
             "decision_number": canonical_number or number,

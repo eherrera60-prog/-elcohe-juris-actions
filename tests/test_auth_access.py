@@ -1,3 +1,4 @@
+import asyncio
 import os
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -7,6 +8,7 @@ import jwt
 from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from starlette.requests import Request
 
 from app import app
 from auth_access import (
@@ -45,7 +47,7 @@ class IndividualAccessTests(unittest.TestCase):
         token_claims["missing-permission-token"] = {
             "sub": "auth0|member",
         }
-        def decode_mock(token):
+        def decode_mock(token, *, audience=AUTH0_AUDIENCE):
             if token == "invalid-token":
                 raise HTTPException(401, "Token OAuth inválido.")
             return token_claims[token]
@@ -174,6 +176,17 @@ class IndividualAccessTests(unittest.TestCase):
             headers=self.bearer("machine-token"),
         )
         self.assertEqual(machine_access.status_code, 200)
+        machine_admin_health = self.client.get(
+            "/v1/admin/database/health",
+            headers=self.bearer("machine-token"),
+        )
+        self.assertEqual(machine_admin_health.status_code, 403)
+        machine_admin_update = self.client.put(
+            "/v1/admin/users/status",
+            json={"subject": "auth0|another-user", "status": "ACTIVE"},
+            headers=self.bearer("machine-token"),
+        )
+        self.assertEqual(machine_admin_update.status_code, 403)
 
     def test_admin_permissions_and_individual_revocation(self):
         body = {"subject": "auth0|member", "status": "ACTIVE"}
@@ -256,6 +269,24 @@ class IndividualAccessTests(unittest.TestCase):
             jwks_factory.assert_called_with(
                 "https://identity.example/.well-known/jwks.json"
             )
+            mcp_resource = "https://mcp.example/mcp"
+            mcp_token = jwt.encode(
+                {
+                    "sub": "auth0|member",
+                    "iss": "https://identity.example/",
+                    "aud": mcp_resource,
+                    "iat": int(now.timestamp()),
+                    "exp": int((now + timedelta(minutes=5)).timestamp()),
+                },
+                private_key,
+                algorithm="RS256",
+            )
+            self.assertEqual(
+                decode_access_token(mcp_token, audience=mcp_resource)["sub"],
+                "auth0|member",
+            )
+            with self.assertRaises(HTTPException):
+                decode_access_token(mcp_token)
 
             wrong_audience = jwt.encode(
                 {
@@ -332,6 +363,40 @@ class IndividualAccessTests(unittest.TestCase):
             with self.assertRaises(HTTPException) as error:
                 decode_access_token(invalid_signature)
             self.assertEqual(error.exception.status_code, 401)
+
+    def test_mcp_token_validation_uses_the_canonical_resource_audience(self):
+        request = Request(
+            {
+                "type": "http",
+                "asgi": {"version": "3.0"},
+                "http_version": "1.1",
+                "method": "POST",
+                "scheme": "https",
+                "path": "/mcp",
+                "raw_path": b"/mcp",
+                "query_string": b"",
+                "headers": [],
+                "server": ("mcp.example", 443),
+                "client": ("127.0.0.1", 12345),
+            }
+        )
+        with patch.dict(
+            os.environ,
+            {"RENDER_EXTERNAL_URL": "https://mcp.example"},
+        ), patch(
+            "auth_access.decode_access_token",
+            return_value={
+                "sub": "auth0|bootstrap-admin",
+                "permissions": [REQUIRED_PERMISSION],
+            },
+        ) as decode:
+            user = asyncio.run(require_active_user(request, token="test-token"))
+
+        self.assertEqual(user["role"], "admin")
+        self.assertEqual(
+            decode.call_args.kwargs["audience"],
+            "https://mcp.example/mcp",
+        )
 
     def test_action_schema_declares_oauth_for_jurisprudence_routes(self):
         response = self.client.get("/openapi.json")

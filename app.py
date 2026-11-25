@@ -10,7 +10,11 @@ from fastapi.openapi.utils import get_openapi
 from pydantic import BaseModel, HttpUrl, Field
 from pypdf import PdfReader
 from auth_access import require_active_user, require_admin, router as access_router
-from decision_number import OfficialDecisionNumber
+from decision_number import (
+    HISTORICAL_SCJ_NUMBER_LABEL,
+    HISTORICAL_SCJ_NUMBER_SOURCE,
+    OfficialDecisionNumber,
+)
 
 APP_VERSION = "1.6.5"
 MAX_DOCUMENT_BYTES = 12 * 1024 * 1024
@@ -91,10 +95,17 @@ def fold(v: str | None) -> str:
 
 def canonical_scj_identifier(value: str | None) -> str | None:
     value = normalize_space(value)
-    value = re.sub(r"^N[ÚU]M\.?\s*", "", value, flags=re.I)
-    match = SCJ_IDENTIFIER_PATTERN.fullmatch(value)
+    modern_value = re.sub(
+        rf"^{HISTORICAL_SCJ_NUMBER_LABEL}\s*", "", value, flags=re.I
+    )
+    match = SCJ_IDENTIFIER_PATTERN.fullmatch(modern_value)
     if not match:
-        return None
+        historical = re.fullmatch(
+            rf"(?:{HISTORICAL_SCJ_NUMBER_LABEL}\s*)?(\d{{1,5}})",
+            value,
+            re.I,
+        )
+        return f"NÚM. {int(historical.group(1))}" if historical else None
     return "-".join(re.findall(r"[A-Z]+|\d+", match.group(0).upper()))
 
 def allowed_host(host: str | None) -> bool:
@@ -112,6 +123,18 @@ def _institutional_headers(text: str) -> list[tuple[str, int, int]]:
             headers.append(("TC", match.start(), match.end()))
         elif re.fullmatch(r"(?:republica dominicana\s+)?suprema corte de justicia(?:\s+de la republica dominicana)?", line):
             headers.append(("SCJ", match.start(), match.end()))
+        else:
+            historical_chamber = re.search(
+                r"\ben nombre de la republica,?\s+(?:la\s+)?"
+                r"(camara\s+[^,\n]{1,100}?suprema corte de justicia)\b",
+                line,
+            )
+            if historical_chamber:
+                headers.append((
+                    "SCJ",
+                    match.start() + historical_chamber.start(1),
+                    match.start() + historical_chamber.end(1),
+                ))
     return headers
 
 def _primary_identifier(text: str) -> tuple[str, str] | None:
@@ -129,12 +152,13 @@ def _primary_identifier(text: str) -> tuple[str, str] | None:
         for court, pattern in patterns for match in pattern.finditer(opening)
     )
     historical = re.search(
-        r"(?im)^\s*SENTENCIA\s+DEL\s+[^\n]{1,140}?N[ÚU]M\.?\s*(\d{1,5})\s*$",
+        rf"(?im)^\s*SENTENCIA\s+DEL\s+[^\n]{{1,140}}?"
+        rf"(?P<number>{HISTORICAL_SCJ_NUMBER_SOURCE})\s*$",
         opening[:700],
     )
     if historical:
         candidates.append((historical.start(), historical.end(), "SCJ",
-                           f"NÚM. {int(historical.group(1))}"))
+                           canonical_scj_identifier(historical.group("number"))))
         candidates.sort()
     scj_title = re.search(
         rf"(?im)^\s*SENTENCIA\s+DEL\s+[^\n]{{1,140}}?N[ÚU]M\.?\s*"
@@ -330,12 +354,12 @@ def extract_metadata_from_text(text: str, court: str | None) -> dict[str, Any]:
         if m: meta["case_number"] = m.group(0).upper()
         meta["chamber"] = "Tribunal Constitucional"
         # Date is the issuance formula, not a date in the procedural history.
-        m = re.search(r"\ba los\s+([a-záéíóúñ ]+?)\s*\(\s*(\d{1,2})\s*\)\s*d[ií]as?\s+del\s+mes\s+de\s+(" + "|".join(MONTHS) + r")\s+del\s+a[nñ]o\s+dos\s+mil\s+[a-záéíóúñ ]+?\(\s*(20\d{2})\s*\)", opening, re.I)
+        m = re.search(r"\ba los\s+([a-záéíóúñ ]+?)\s*\(\s*(\d{1,2})\s*\)\s*d[ií]as?\s+del\s+mes\s+de\s+(" + "|".join(MONTHS) + r")\s+del\s+a[nñ]o\s+dos\s+mil\s+[a-záéíóúñ ]+?\(\s*((?:19|20)\d{2})\s*\)", opening, re.I)
         if m: meta["date"] = f"{int(m.group(2))} de {m.group(3).lower()} de {m.group(4)}"
         if not meta["date"]:
             m = re.search(r"\ba los\s+([a-záéíóúñ ]+?)\s*\(\s*(\d{1,2})\s*\)\s*d[ií]as?\s+del\s+mes\s+de\s+(" + "|".join(MONTHS) + r")\s+del\s+a[nñ]o", opening, re.I)
             if m:
-                y = re.search(r"\b(20\d{2})\b", opening[m.end():m.end()+110])
+                y = re.search(r"\b((?:19|20)\d{2})\b", opening[m.end():m.end()+110])
                 if y: meta["date"] = f"{int(m.group(2))} de {m.group(3).lower()} de {y.group(1)}"
     elif court == "SCJ":
         m = re.search(r"\b\(?(20\d{2}-R\d{5,})\)?", opening, re.I)
@@ -345,8 +369,29 @@ def extract_metadata_from_text(text: str, court: str | None) -> dict[str, Any]:
             if m: meta["case_number"] = m.group(1)
         m = re.search(r"\b(PRIMERA|SEGUNDA|TERCERA)\s+SALA\s+DE\s+LA\s+SUPREMA", opening, re.I)
         if m: meta["chamber"] = m.group(1).capitalize() + " Sala"
-        m = re.search(r"\ben fecha\s+(\d{1,2})\s+de\s+(" + "|".join(MONTHS) + r")\s+de\s+(20\d{2})", opening, re.I)
-        if m: meta["date"] = f"{int(m.group(1))} de {m.group(2).lower()} de {m.group(3)}"
+        if not meta["chamber"]:
+            m = re.search(
+                r"\b(C[aá]mara\s+[a-záéíóúñ]+(?:\s+(?:y|de)\s+[a-záéíóúñ]+)?)"
+                r"\s+de\s+la\s+Suprema\s+Corte\s+de\s+Justicia\b",
+                opening,
+                re.I,
+            )
+            if m:
+                meta["chamber"] = normalize_space(m.group(1))
+        title_date = re.search(
+            r"(?im)^\s*SENTENCIA\s+DEL\s+(\d{1,2})\s+DE\s+("
+            + "|".join(MONTHS)
+            + r")\s+DE\s+((?:19|20)\d{2})\b",
+            opening[:700],
+        )
+        if title_date:
+            meta["date"] = (
+                f"{int(title_date.group(1))} de "
+                f"{title_date.group(2).lower()} de {title_date.group(3)}"
+            )
+        m = re.search(r"\ben fecha\s+(\d{1,2})\s+de\s+(" + "|".join(MONTHS) + r")\s+de\s+((?:19|20)\d{2})", opening, re.I)
+        if m and not meta["date"]:
+            meta["date"] = f"{int(m.group(1))} de {m.group(2).lower()} de {m.group(3)}"
     return meta
 
 # Attribution is deliberately conservative: a keyword alone is not judicial authorship.
@@ -363,12 +408,28 @@ PARTY_INTRO = re.compile(
 SCJ_PARTY_ASSERTION = re.compile(
     r"^(?:\d+[).]\s*)?que\s+(?:la parte (?:recurrente|recurrida) no ha establecido|"
     r"la alzada fundament[oó])\b", re.I)
+SCJ_PARTY_NARRATIVE = re.compile(
+    r"^(?:considerando,\s*)?(?:que\s+)?"
+    r"(?:los recurrentes?|las recurrentes?|la parte recurrente|"
+    r"la parte recurrida|el recurrente|la recurrente)\s+"
+    r"(?:invocan?|alegan?|sostienen?|solicitan?|pretenden?|"
+    r"reclaman?|exponen?|aducen?|concluyen?)\b|"
+    r"^considerando,\s*que\s+en sus conclusiones\b.{0,180}"
+    r"\b(?:invoc[oó]|aleg[oó]|solicit[oó]|pretendi[oó])\b",
+    re.I,
+)
 QUOTED_LOWER_COURT = re.compile(
     r"(?:finalmente\s+concluye\s+la\s+corte\s+motivando\s+lo\s+siguiente)|"
     r"(?:la corte|el tribunal|la alzada)\s+(?:motiv[oó]|expres[oó]|estableci[oó]|"
     r"concluy[oó]|consider[oó])\s+(?:lo siguiente|que)|"
     r"(?:la sentencia|el fallo)\s+(?:impugnada|recurrida)\s+(?:establece|expresa|señala)", re.I)
 DISPOSITIVE_INTRO = re.compile(r"^\s*(?:FALLA|DECIDE|RESUELVE)\s*:?\s*$", re.I)
+HISTORICAL_DISPOSITIVE_INTRO = re.compile(
+    r"^\s*(?:por tales motivos\b|(?:FALLA|DECIDE|RESUELVE)\s*:|"
+    r"(?:[ÚU]NICO|PRIMERO|SEGUNDO|TERCERO|CUARTO|QUINTO|SEXTO|"
+    r"S[EÉ]PTIMO|OCTAVO|NOVENO|D[EÉ]CIMO)\s*:)",
+    re.I,
+)
 NUMBERED_START = re.compile(r"(?m)^\s*\d{1,3}[).]\s+")
 
 def strip_running_furniture(text: str) -> str:
@@ -701,7 +762,7 @@ def extract_numbered_foundations(pages: list[dict], court: str | None = None) ->
                 if "despues de haber deliberado" in normalized:
                     active = True
                     continue
-                if active and re.match(r"^(FALLA|DECIDE|RESUELVE)\s*:", paragraph, re.I):
+                if active and HISTORICAL_DISPOSITIVE_INTRO.match(paragraph):
                     active = False
                     break
                 if active and len(paragraph) >= 80:
@@ -718,7 +779,13 @@ def extract_numbered_foundations(pages: list[dict], court: str | None = None) ->
 
 def extract_dispositive_passage(pages: list[dict]) -> dict | None:
     """Extract the final explicit operative section as source text, not legal analysis."""
-    marker = re.compile(r"^\s*(?:FALLA|DECIDE|RESUELVE)\s*:\s*(.*)$", re.I)
+    marker = re.compile(
+        r"^\s*(?:(?:FALLA|DECIDE|RESUELVE)\s*:\s*|"
+        r"POR\s+TALES\s+MOTIVOS\s*,?\s*"
+        r"(?=(?:[ÚU]NICO|PRIMERO|SEGUNDO|TERCERO|CUARTO|QUINTO|SEXTO|"
+        r"S[EÉ]PTIMO|OCTAVO|NOVENO|D[EÉ]CIMO)\s*:))",
+        re.I,
+    )
     signature = re.compile(
         r"^\s*(?:(?:la presente|esta) (?:sentencia|decisi[oó]n)"
         r".{0,100}\b(?:dada y firmada|firmada por)\b|firmad[oa]\s*:|"
@@ -822,6 +889,10 @@ def annotate_foundation_attribution(units: list[dict], court: str | None = None)
         if court == "SCJ" and SCJ_PARTY_ASSERTION.match(txt):
             attr = "PARTY_ARGUMENT_OR_MIXED_REVIEW"
             indicators = ["numbered_scj_party_response"]
+            party_response_open = True
+        elif court == "SCJ" and SCJ_PARTY_NARRATIVE.search(txt):
+            attr = "PARTY_ARGUMENT_OR_MIXED_REVIEW"
+            indicators = ["historical_party_submission_narrative"]
             party_response_open = True
         elif court == "SCJ" and party_response_open and re.match(r"^\d+[).]\s*que\b", txt, re.I):
             attr = "PARTY_ARGUMENT_OR_MIXED_REVIEW"

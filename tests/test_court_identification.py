@@ -1,15 +1,18 @@
 import unittest
 
 from app import (
+    OfficialPdfRequest,
     annotate_foundation_attribution,
     allowed_host,
     decision_number_matches,
     detect_court,
     extract_document_text,
+    extract_metadata_from_text,
     find_relevant_passages,
     primary_decision_number,
 )
 from fastapi import HTTPException
+from juris_164 import FoundationExtractionRequest, _scj_candidates
 
 
 class CourtIdentificationTests(unittest.TestCase):
@@ -47,6 +50,55 @@ La ordenanza impugnada fue dictada por la Segunda Sala de la Cámara Civil.
         self.assertEqual(primary_decision_number(text, "SCJ"), "NÚM. 14")
         self.assertTrue(decision_number_matches(text, "SCJ", "NÚM. 14"))
         self.assertFalse(decision_number_matches(text, "SCJ", "NÚM. 15"))
+
+    def test_scj_historical_number_variants_are_accepted_by_recovery_and_extraction(self):
+        text = """SENTENCIA DEL 14 DE ENERO DE 1999, No. 2
+En Nombre de la República, la Cámara Penal de la Suprema Corte de Justicia,
+regularmente constituida, dicta la siguiente sentencia.
+"""
+        self.assertEqual(detect_court(None, text=text), "SCJ")
+        self.assertEqual(primary_decision_number(text, "SCJ"), "NÚM. 2")
+        self.assertEqual(
+            extract_metadata_from_text(text, "SCJ"),
+            {
+                "decision_number": "NÚM. 2",
+                "date": "14 de enero de 1999",
+                "case_number": None,
+                "chamber": "Cámara Penal",
+            },
+        )
+
+        for number in ("No. 2", "No 2", "Núm. 2", "Núm 2", "Nº 2", "N.° 2", "2"):
+            with self.subTest(number=number):
+                self.assertTrue(decision_number_matches(text, "SCJ", number))
+                common = {
+                    "url": "https://transparencia.poderjudicial.gob.do/documento.pdf",
+                    "expected_court": "SCJ",
+                    "expected_number": number,
+                }
+                OfficialPdfRequest(**common)
+                FoundationExtractionRequest(**common)
+
+    def test_scj_search_historical_number_is_canonicalized_for_follow_up_tools(self):
+        results, count = _scj_candidates(
+            {
+                "recordsFiltered": 1,
+                "data": [{
+                    "noSentencia": "No. 2",
+                    "descTribunal": "CÁMARA PENAL",
+                    "fechaFallo": "1999-01-14",
+                    "urlBlob": (
+                        "https://consultasentenciascj.poderjudicial.gob.do/"
+                        "historical-2.pdf"
+                    ),
+                }],
+            },
+            lambda host: host == "consultasentenciascj.poderjudicial.gob.do",
+        )
+
+        self.assertEqual(count, 1)
+        self.assertEqual(results[0]["decision_number"], "NÚM. 2")
+        self.assertEqual(results[0]["reported_decision_number"], "No. 2")
 
     def test_scj_party_response_and_mixed_reasoning_are_not_attributed_as_court(self):
         units = [

@@ -4,7 +4,7 @@ import hashlib
 import psycopg
 from psycopg.conninfo import conninfo_to_dict
 
-HOST = "dpg-dbi0vsei0phs73ch9pdg-a"
+HOST = "dpg-dbi0vsei0phs73ch9pdg-a.oregon-postgres.render.com"
 DB = "elcohe_juris_164_db"
 USER = "elcohe_juris_nuevo"
 
@@ -14,7 +14,14 @@ def ejecutar():
         raise RuntimeError("DATABASE_URL ausente")
 
     datos = conninfo_to_dict(url)
-    if (datos.get("host"), datos.get("dbname"), datos.get("user")) != (HOST, DB, USER):
+    if (
+        datos.get("host") not in (
+            "dpg-dbi0vsei0phs73ch9pdg-a",
+            "dpg-dbi0vsei0phs73ch9pdg-a.oregon-postgres.render.com",
+        )
+        or datos.get("dbname") != DB
+        or datos.get("user") != USER
+    ):
         raise RuntimeError("Base de datos no autorizada")
 
     identificador = "PRUEBA-" + uuid.uuid4().hex
@@ -23,7 +30,7 @@ def ejecutar():
     with psycopg.connect(url, autocommit=False) as conn:
         try:
             with conn.cursor() as cur:
-                cur.execute("SELECT current_database(), current_user")
+                cur.execute("SELECT current_database(), session_user")
                 if cur.fetchone() != (DB, USER):
                     raise RuntimeError("Identidad PostgreSQL incorrecta")
 
