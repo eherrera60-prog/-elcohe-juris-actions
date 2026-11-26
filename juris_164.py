@@ -1089,8 +1089,32 @@ async def search_scj_candidates(
                 # La búsqueda institucional es exploratoria.
                 # No acredita por sí misma pertinencia jurídica.
                 candidatos_evaluados = []
-                for candidato in archive["results"][:limit]:
+                stopwords = {
+                    "de", "del", "la", "el", "los", "las",
+                    "por", "en", "un", "una", "y", "que",
+                }
+                query_terms = set(re.findall(
+                    r"[a-z0-9]+", fold(normalized_query)
+                )) - stopwords
+
+                ranked_archive = []
+                for item in archive["results"]:
+                    title = fold(str(item.get("title") or ""))
+                    title_terms = set(re.findall(r"[a-z0-9]+", title))
+                    relevance = len(query_terms & title_terms) / max(
+                        len(query_terms), 1
+                    )
+                    ranked_archive.append((relevance, item))
+
+                ranked_archive.sort(key=lambda pair: -pair[0])
+
+                for relevance, candidato in ranked_archive[:limit]:
                     candidato = dict(candidato)
+                    candidato["title_term_overlap"] = round(relevance, 3)
+                    candidato["preliminary_relevance"] = (
+                        "LOW_TITLE_MATCH" if relevance < 0.5
+                        else "POSSIBLE_TITLE_MATCH"
+                    )
                     candidato["relevance_status"] = "NOT_VERIFIED"
                     candidato["legal_relevance_verified"] = False
                     candidato["relevance_review_required"] = True

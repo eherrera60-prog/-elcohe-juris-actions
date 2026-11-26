@@ -435,10 +435,40 @@ NUMBERED_START = re.compile(r"(?m)^\s*\d{1,3}[).]\s+")
 def strip_running_furniture(text: str) -> str:
     # Apply the same cleanup to analysis and promotion; preserve line breaks.
     text = clean_page_text(text)
+    # Remove the identified TC multiline running header.
+    text = re.sub('(?im)^[ \\t]*Expediente[ \\t]+n[úu]m\\.[ \\t]*TC[-/][^\\n]*\\n(?:[ \\t]*parte[ \\t]+recurrente[ \\t]+y[ \\t]+decisi[oó]n[ \\t]+impugnada[ \\t]*\\n)[ \\t]*P[aá]gina[ \\t]+\\d+[ \\t]+de[ \\t]+\\d+[ \\t]*(?=\\n|$)', "", text)
     kept = []
     for line in text.splitlines():
         t = normalize_space(line)
         if re.match(r"^(?:Exp\. n[uú]m\.|Partes:|Materia:|Decisi[oó]n:|Ponente:|WT/|P[aá]g\.\s*\d+)", t, re.I):
+            continue
+        if re.fullmatch(
+            r"(?:REP[ÚU]BLICA DOMINICANA\s+)?"
+            r"(?:TRIBUNAL CONSTITUCIONAL|SUPREMA CORTE DE JUSTICIA)"
+            r"(?:\s+DE LA REP[ÚU]BLICA DOMINICANA)?",
+            t, re.I,
+        ):
+            continue
+
+        if re.fullmatch(
+            r"P[aá]gina\s+\d+\s+de\s+\d+",
+            t, re.I,
+        ):
+            continue
+
+        if re.fullmatch(
+            r"(?:SCJ-[A-Z]+-\d{2}-\d+\s*)?"
+            r"\(809\)\s*533-3191\s*[•·]?\s*"
+            r"Direcci[oó]n de Internet:\s*"
+            r"https?://(?:www\.)?poderjudicial\.gob\.do/?",
+            t, re.I,
+        ):
+            continue
+
+        if re.match(
+            r"^Expediente\s+n[úu]m\.\s*TC[-/]",
+            t, re.I,
+        ):
             continue
         kept.append(line)
     return "\n".join(kept)
@@ -665,7 +695,25 @@ def extract_document_text(doc):
         for i,p in enumerate(reader.pages,1):
             try: txt = (p.extract_text() or "").replace("\r\n", "\n")
             except Exception: txt = ""
-            pages.append({"page":i,"text":txt})
+            printed = re.findall(
+                r"(?im)^\s*P[aá]gina\s+(\d+)\s+de\s+(\d+)\s*$",
+                txt,
+            )
+            labels = set(printed)
+            printed_page = None
+            printed_total = None
+            if len(labels) == 1:
+                number, total = next(iter(labels))
+                if 1 <= int(number) <= int(total):
+                    printed_page = int(number)
+                    printed_total = int(total)
+
+            pages.append({
+                "page": i,
+                "text": txt,
+                "printed_page": printed_page,
+                "printed_page_total": printed_total,
+            })
         full = "\n\n".join(p["text"] for p in pages if p["text"])
         return {"document_type":"PDF","pages":pages,"full_text":full,"page_count":len(pages),"extraction_ok":len(full.strip()) >= 100}
     if "html" in ct:
@@ -811,16 +859,6 @@ def extract_dispositive_passage(pages: list[dict]) -> dict | None:
     for page_index in range(start_page_index, len(cleaned_pages)):
         page_number, lines = cleaned_pages[page_index]
         start = start_line_index if page_index == start_page_index else 0
-        if page_index > start_page_index:
-            page_counter = next(
-                (
-                    index for index, line in enumerate(lines)
-                    if re.match(r"^\s*P[aá]gina\s+\d+\s+de\s+\d+\b", line, re.I)
-                ),
-                None,
-            )
-            if page_counter is not None:
-                start = page_counter + 1
         for line in lines[start:]:
             if signature.match(line):
                 break
@@ -1500,7 +1538,7 @@ async def resolve_official_pdf(req: OfficialPdfRequest):
     doc = await fetch_document(str(req.url))
     if doc["data"][:4] == b"%PDF":
         return {"status": "PDF_CANDIDATE", "candidates": [doc["final_url"]],
-                "note": "Use verifyOfficialPdf to examine this document."}
+                "note": "REST: verifyOfficialPdf. MCP: verify_official_document."}
     if "html" not in doc["content_type"]:
         raise HTTPException(415, "La fuente no es HTML ni PDF.")
     soup = BeautifulSoup(doc["text_response"] or "", "html.parser")
@@ -1567,7 +1605,7 @@ async def verify_official_pdf(req: OfficialPdfRequest):
             "page_count": ex["page_count"], "source_url": doc["final_url"],
             "sha256_pdf": doc["sha256"], "document_type": "PDF",
             "ratio_decidendi_verified": False, "review_required": True,
-            "note": "Para cotejar fundamentos concretos utilice readOfficialDecisionExcerpt con páginas específicas."}
+            "note": "REST: readOfficialDecisionExcerpt. MCP: extract_decision_passages."}
 
 async def _analyze_official_decision(
     req: AnalyzeDecisionRequest,

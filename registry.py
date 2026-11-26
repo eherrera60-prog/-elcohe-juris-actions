@@ -364,7 +364,7 @@ def find_verified_decisions(
     conditions.append(
         "(d.decision_number ILIKE %s ESCAPE '\\' "
         "OR COALESCE(d.legal_issue,'') ILIKE %s ESCAPE '\\' "
-        "OR COALESCE(d.chamber,'') ILIKE %s ESCAPE '\\')"
+        "OR COALESCE(d.chamber,d.metadata->>'chamber','') ILIKE %s ESCAPE '\\')"
     )
     pattern = f"%{escaped}%"
     parameters.extend((pattern, pattern, pattern, limit))
@@ -389,6 +389,14 @@ def find_verified_decisions(
                 fields = [column.name for column in cur.description]
                 items = [row_to_dict(row, fields) for row in cur.fetchall()]
         for item in items:
+            metadata = item.get("metadata") or {}
+            for field, key in (
+                ("chamber", "chamber"),
+                ("case_number", "case_number"),
+                ("decision_date", "date"),
+            ):
+                if not item.get(field) and metadata.get(key):
+                    item[field] = metadata[key]
             item["retrieval_mode"] = "PREVIOUSLY_VERIFIED_DOCUMENT"
             item["document_bytes_persisted"] = True
             item["official_document_verified"] = True

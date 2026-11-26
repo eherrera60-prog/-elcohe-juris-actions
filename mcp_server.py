@@ -203,6 +203,30 @@ def _rank_ratio_candidates(evidence: dict, legal_issue: str | None) -> list[dict
             )
         ):
             continue
+        narrative = re.sub(
+            r"^\s*\d+(?:\.\d+)*[.)]?\s*", "", normalized_text
+        )
+        if re.match(
+            r"(?:en el presente caso,?\s*)?"
+            r"(?:el recurso se fundamenta|"
+            r"el recurrente (?:alega|sostiene|indica|aduce)|"
+            r"la parte recurrente (?:alega|sostiene|indica)|"
+            r"la alzada,? de su parte,? constato)\b",
+            narrative,
+        ):
+            continue
+
+        admissibility_only = bool(re.search(
+            r"\b(?:requisitos de admisibilidad|"
+            r"especial trascendencia|recurso resulta admisible|"
+            r"requisitos de los literales)\b",
+            narrative,
+        ))
+        admissibility_requested = bool(
+            issue_tokens & tokenize(
+                "admisibilidad trascendencia procedencia"
+            )
+        )
         passage_tokens = tokenize(text)
         matched_issue = issue_tokens & passage_tokens
         minimum_issue_matches = min(2, len(issue_tokens))
@@ -230,13 +254,19 @@ def _rank_ratio_candidates(evidence: dict, legal_issue: str | None) -> list[dict
                 if shared_outcome
                 else "DECISIONAL_LINK_REQUIRES_HUMAN_REVIEW"
             ),
+            "reasoning_scope": (
+                "ADMISSIBILITY_REVIEW"
+                if admissibility_only else "SUBSTANTIVE_OR_UNDETERMINED"
+            ),
             "_ranking": (
+                int(not admissibility_only or admissibility_requested),
+                int(has_decisional_link),
                 issue_relevance,
                 len(shared_outcome),
             ),
         })
     candidates.sort(key=lambda item: (
-        -item["_ranking"][0], -item["_ranking"][1]
+        tuple(-value for value in item["_ranking"])
     ))
     for candidate in candidates:
         candidate.pop("_ranking")
@@ -615,7 +645,28 @@ def install_mcp(
     @mcp.tool()
     def get_verified_decision_document(decision_id: int) -> dict:
         """Recupera bytes PDF almacenados en PostgreSQL tras verificar nuevamente su SHA-256."""
-        document = get_verified_document(decision_id)
+        try:
+            document = get_verified_document(decision_id)
+        except HTTPException as exc:
+            if exc.status_code == 404:
+                status = "DOCUMENT_NOT_FOUND"
+            elif exc.status_code == 503:
+                status = "STORAGE_ERROR"
+            elif decision_id < 1:
+                status = "INVALID_DECISION_ID"
+            else:
+                status = "DOCUMENT_VERIFICATION_FAILED"
+            return {
+                "status": status,
+                "decision_id": decision_id,
+                "http_status": exc.status_code,
+                "message": str(exc.detail),
+                "document_recovered": False,
+                "official_source_verified": False,
+                "identity_verified": False,
+                "ratio_decidendi_verified": False,
+                "review_required": True,
+            }
         document_bytes = document.pop("document_bytes")
         document.update({
             "status": "DOCUMENT_RECOVERED_FROM_POSTGRESQL",
