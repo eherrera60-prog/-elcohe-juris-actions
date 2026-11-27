@@ -1830,6 +1830,8 @@ app.include_router(registry_router)
 
 # Acceso individual y administración restringida a identidades bootstrap.
 app.include_router(access_router)
+from oauth_actions_165 import router as oauth_actions_router
+app.include_router(oauth_actions_router)
 
 # Aprobación jurídica humana auditable (sin modificar los endpoints legados).
 from registry_promotion import router as registry_promotion_router

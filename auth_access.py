@@ -287,6 +287,8 @@ async def require_active_user(
     if token is None and (request.method, request.url.path) in {
         ("GET", "/"),
         ("GET", "/auth/login"),
+        ("GET", "/oauth/authorize"),
+        ("POST", "/oauth/token"),
         ("GET", "/auth/callback"),
         ("GET", "/portal"),
         ("POST", "/auth/logout"),
